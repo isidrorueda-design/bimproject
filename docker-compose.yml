@@ -1,0 +1,17 @@
+# docker-compose.yml
+version: '3.8'
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: contech_db
+    environment:
+      POSTGRES_USER: contech_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD} # Lee la contraseña desde el archivo .env
+      POSTGRES_DB: contech_db
+    ports:
+      - "5432:5432" # Expone el puerto de la BD a tu máquina local
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
