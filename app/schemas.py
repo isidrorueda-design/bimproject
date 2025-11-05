@@ -3,6 +3,28 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import date
 
+# --- Esquemas para Autenticación y Usuarios ---
+
+class UserBase(BaseModel):
+    username: str
+
+class UserCreate(UserBase):
+    password: str
+
+class User(UserBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+
 # --- Modelo Base para Tarea ---
 class TaskBase(BaseModel):
     name: str

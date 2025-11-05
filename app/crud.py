@@ -4,11 +4,14 @@ from . import models, schemas
 from typing import List, Dict
 import openpyxl
 import io
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
     """
     Importa tareas desde un archivo Excel (bytes) a un proyecto.
-    
+
     Asume un formato de Excel específico:
     - Columna A: Nivel (ej. 1, 2, 3...)
     - Columna B: Nombre de la Tarea
@@ -16,7 +19,7 @@ def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
     - Columna D: Fecha de Fin (YYYY-MM-DD)
     - Columna E: Descripción (Opcional)
     """
-    
+
     # Carga el archivo Excel desde los bytes en memoria
     workbook = openpyxl.load_workbook(io.BytesIO(file_contents))
     sheet = workbook.active
@@ -27,9 +30,9 @@ def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
     # Si llega una tarea Nivel 3, su padre es task_id_C.
     # Si llega una tarea Nivel 2, su padre es task_id_A.
     last_parent_at_level: Dict[int, int] = {}
-    
+
     tasks_created = 0
-    
+
     # Iteramos por las filas, saltando el encabezado (fila 1)
     for row in sheet.iter_rows(min_row=2, values_only=True):
         try:
@@ -47,7 +50,7 @@ def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
             if level > 1:
                 # Si no es nivel 1, buscamos su padre en el nivel anterior (level - 1)
                 parent_id = last_parent_at_level.get(level - 1)
-            
+
             # 1. Creamos el Schema de la tarea
             task_schema = schemas.TaskCreate(
                 name=name,
@@ -56,14 +59,14 @@ def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
                 end_date=end_date,
                 parent_id=parent_id
             )
-            
+
             # 2. Creamos la Tarea en la BD usando nuestra función CRUD existente
             db_task = create_task(db=db, task=task_schema, project_id=project_id)
-            
+
             # 3. Actualizamos nuestro rastreador de jerarquía
             # Guardamos esta tarea como el último padre de SU nivel
             last_parent_at_level[level] = db_task.id
-            
+
             # Limpiamos los niveles inferiores para evitar errores
             # (Si creamos un Nivel 2, ya no puede haber un Nivel 3 "hijo" del anterior)
             levels_to_clear = [lvl for lvl in last_parent_at_level if lvl > level]
@@ -76,7 +79,7 @@ def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
             # En una app real, aquí registrarías el error
             print(f"Error procesando fila: {row}. Error: {e}")
             continue
-            
+
     return {"message": f"{tasks_created} tareas importadas exitosamente."}
 # === Funciones de Proyecto ===
 
@@ -114,7 +117,7 @@ def get_project_tasks_as_tree(db: Session, project_id: int) -> List[schemas.Task
     """
     # 1. Obtenemos todas las tareas del proyecto de la BD
     db_tasks = get_project_tasks(db=db, project_id=project_id)
-    
+
     # 2. Convertimos los modelos de BD (models.Task) a schemas (schemas.Task)
     #    y las ponemos en un mapa para acceso rápido por ID.
     task_schema_map = {}
@@ -134,5 +137,19 @@ def get_project_tasks_as_tree(db: Session, project_id: int) -> List[schemas.Task
         else:
             # Si no tiene padre, es una tarea raíz.
             root_tasks.append(task)
-            
+
     return root_tasks
+
+
+# === Funciones de Usuario ===
+
+def get_user_by_username(db: Session, username: str):
+    return db.query(models.User).filter(models.User.username == username).first()
+
+def create_user(db: Session, user: schemas.UserCreate):
+    hashed_password = pwd_context.hash(user.password)
+    db_user = models.User(username=user.username, hashed_password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
