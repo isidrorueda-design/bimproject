@@ -37,7 +37,30 @@ class ProjectCreate(ProjectBase):
 
 class Project(ProjectBase):
     id: int
+    owner_id: int
     tasks: List[Task] = [] # Devolverá solo las tareas RAÍZ
 
     class Config:
         orm_mode = True
+
+# --- Modelo Base para Usuario ---
+class UserBase(BaseModel):
+    username: str
+
+class UserCreate(UserBase):
+    password: str
+
+class User(UserBase):
+    id: int
+    projects: List[Project] = []
+
+    class Config:
+        orm_mode = True
+
+# --- Modelos para Token (JWT) ---
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
