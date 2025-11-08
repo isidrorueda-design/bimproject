@@ -1,0 +1,29 @@
+# Entorno Virtual
+.venv/
+venv/
+ENV/
+
+# Archivos de caché de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de base de datos local
+*.sqlite3
+*.db
+
+# Archivos de configuración de IDEs
+.vscode/
+.idea/
+
+# Archivos de dependencias de Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
+
+# Archivos de entorno (si los usas para guardar secretos)
+.env
