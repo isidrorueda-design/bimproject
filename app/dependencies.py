@@ -58,6 +58,16 @@ async def get_current_company_user(
         )
     return current_user
 
+async def get_current_company_admin(
+    current_user: models.User = Depends(get_current_active_user)
+):
+    if current_user.role not in ["admin", "super_admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Operación no permitida. Se requieren privilegios de Administrador."
+        )
+    return current_user
+
 async def get_current_user_in_company(
     current_user: models.User = Depends(get_current_active_user)
 ):

@@ -7,20 +7,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from starlette.concurrency import run_in_threadpool
 from datetime import timedelta
-from typing import List
+from typing import List, Optional
 from . import crud, models, schemas, security, dependencies
 from .database import SessionLocal, engine, get_db
-
+from .routers import bcf
 models.Base.metadata.create_all(bind=engine)
 app = FastAPI(title="ConTech PM API")
-
 @app.on_event("startup")
 def create_super_admin_on_startup():
-
     db = SessionLocal()
     try:
-        super_admin = crud.get_user_by_email(db, email="admin@admin.com")
-        
+        super_admin = crud.get_user_by_email(db, email="admin@admin.com")        
         if not super_admin:
             print("Creando usuario Super Admin por defecto (admin@admin.com)...")
             admin_user_schema = schemas.UserCreate(
@@ -32,8 +29,7 @@ def create_super_admin_on_startup():
             crud.create_user(db=db, user=admin_user_schema)
             print("Usuario Super Admin creado. Contraseña: admin")
         else:
-            print("Usuario Super Admin ya existe.")
-            
+            print("Usuario Super Admin ya existe.")            
     finally:
         db.close()
 
@@ -48,6 +44,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(bcf.router)
 
 @app.post("/login", response_model=schemas.Token)
 def login_for_access_token(
@@ -72,12 +70,10 @@ def create_company_endpoint(
     db: Session = Depends(get_db),
     current_super_admin: models.User = Depends(dependencies.get_current_super_admin)
 ):
-
     db_company = crud.get_company_by_name(db, name=company.name)
     if db_company:
         raise HTTPException(status_code=400, detail="Una compañía con este nombre ya existe")
     return crud.create_company(db=db, company=company)
-
 @app.get("/companies/", response_model=List[schemas.Company])
 def read_companies_endpoint(
     db: Session = Depends(get_db),
@@ -89,7 +85,6 @@ def read_companies_endpoint(
 def create_user_endpoint(
     user: schemas.UserCreate, 
     db: Session = Depends(get_db),
-
     current_super_admin: models.User = Depends(dependencies.get_current_super_admin)
 ):
 
@@ -110,14 +105,20 @@ def read_users_me(
 ):
     return current_user
 
+def get_project_for_user(db: Session, project_id: int, company_id: int):
+    db_project = crud.get_project_details(db, project_id=project_id, company_id=company_id)
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado o no pertenece a su compañía")
+    return db_project
+
 @app.post("/projects/", response_model=schemas.Project, status_code=201)
 def create_project(
     project_create_data: schemas.ProjectCreate,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_company_user)
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
 ):
-    if project_create_data.company_id != current_user.company_id:
-        raise HTTPException(status_code=403, detail="No autorizado")
+    if current_user.role != "super_admin" and project_create_data.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="No autorizado para crear proyectos en esta compañía.")
     return crud.create_project(db=db, project=project_create_data)
 
 @app.get("/projects/", response_model=List[schemas.Project])
@@ -127,7 +128,7 @@ def get_projects(
     current_user: models.User = Depends(dependencies.get_current_user_in_company)
 ):
     projects = crud.get_projects(db=db, company_id=current_user.company_id, skip=skip, limit=limit)
-    return [schemas.Project.from_orm(p) for p in projects]
+    return projects
 
 @app.get("/projects/{project_id}", response_model=schemas.Project)
 def get_project_by_id(
@@ -135,280 +136,639 @@ def get_project_by_id(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_user_in_company)
 ):
-    db_project = crud.get_project_details(
+    db_project = get_project_for_user(
         db=db, project_id=project_id, company_id=current_user.company_id
     )
     if not db_project:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado")
 
-    project_schema = schemas.Project.from_orm(db_project)
-    project_schema.tasks = crud.get_project_tasks_as_tree(db=db, project_id=project_id)
-    project_schema.folders = crud.get_all_project_folders(db=db, project_id=project_id)
-    return project_schema
+    return db_project
 
-@app.post("/projects/{project_id}/tasks/", response_model=schemas.Task, status_code=201)
-def create_task_for_project(
+@app.put("/projects/{project_id}", response_model=schemas.Project)
+def update_project_endpoint(
     project_id: int,
-    task: schemas.TaskCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail="Proyecto no encontrado o no autorizado para esta acción."
-        )
-    
-    return crud.create_task(db=db, task=task, project_id=project_id)
-
-@app.put("/tasks/{task_id}", response_model=schemas.Task)
-def update_task_endpoint(
-    task_id: int,
-    task_update: schemas.TaskUpdate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_task = crud.get_task(db, task_id=task_id)
-
-    if not db_task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tarea no encontrada.")
-
-    if db_task.project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="No autorizado para modificar esta tarea."
-        )
-
-    updated_task = crud.update_task(db, task_id=task_id, task_update=task_update)
-    return updated_task
-
-@app.post("/projects/{project_id}/work_items/", response_model=schemas.WorkItem, status_code=201)
-def create_work_item_for_project(
-    project_id: int,
-    work_item: schemas.WorkItemCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado para esta acción."
-        )
-
-    return crud.create_work_item(db=db, work_item=work_item, project_id=project_id)
-
-@app.get("/projects/{project_id}/work_items/", response_model=List[schemas.WorkItem])
-def get_work_items_for_project(
-    project_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado."
-        )
-    
-    return crud.get_project_work_items(db=db, project_id=project_id)
-
-@app.get("/projects/{project_id}/contracts/", response_model=List[schemas.Contract])
-def get_contracts_for_project(
-    project_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado."
-        )
-    
-    return crud.get_project_contracts(db=db, project_id=project_id)
-
-@app.post("/projects/{project_id}/contracts/", response_model=schemas.Contract, status_code=201)
-def create_contract_for_project(
-    project_id: int,
-    contract: schemas.ContractCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado para esta acción."
-        )
-
-    return crud.create_contract(db=db, contract=contract, project_id=project_id)
-
-@app.post("/projects/{project_id}/estimates/", response_model=schemas.Estimate, status_code=201)
-def create_estimate_for_project(
-    project_id: int,
-    estimate: schemas.EstimateCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado para esta acción."
-        )
-
-    db_contract = crud.get_contract(db, contract_id=estimate.contract_id)
-    if not db_contract or db_contract.project_id != project_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El contrato especificado no pertenece a este proyecto."
-        )
-
-    return crud.create_estimate(db=db, estimate=estimate, project_id=project_id)
-
-@app.get("/projects/{project_id}/estimates/", response_model=List[schemas.Estimate])
-def get_estimates_for_project(
-    project_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado."
-        )
-    
-    return crud.get_project_estimates(db=db, project_id=project_id)
-
-@app.delete("/estimates/{estimate_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_estimate_endpoint(
-    estimate_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_estimate = crud.get_estimate_by_id(db, estimate_id=estimate_id)
-
-    if not db_estimate:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estimación no encontrada.")
-
-    if db_estimate.project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="No autorizado para eliminar esta estimación."
-        )
-
-    crud.delete_estimate(db, estimate_id=estimate_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-@app.post("/projects/{project_id}/folders/", response_model=schemas.Folder, status_code=201)
-def create_folder_for_project(
-    project_id: int,
-    folder: schemas.FolderCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_project = crud.get_project(db, project_id=project_id)
-    if not db_project or db_project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Proyecto no encontrado o no autorizado para esta acción."
-        )
-
-    return crud.create_folder(db=db, folder=folder, project_id=project_id)
-
-@app.get("/folders/{folder_id}", response_model=schemas.Folder)
-def get_folder_contents_endpoint(
-    folder_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_folder = crud.get_folder_contents(db, folder_id=folder_id)
-
-    if not db_folder:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carpeta no encontrada.")
-  
-    if db_folder.project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="No autorizado para acceder a esta carpeta."
-        )
-
-    return db_folder
-
-@app.post("/documents/", response_model=schemas.Document, status_code=201)
-def create_document_concept_endpoint(
-    document: schemas.DocumentCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    db_folder = crud.get_folder_contents(db, folder_id=document.folder_id)
-
-    if not db_folder:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="La carpeta especificada no existe.")
-
-    if db_folder.project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="No autorizado para crear documentos en esta carpeta."
-        )
-
-    return crud.create_document_concept(db=db, document=document)
-
-@app.post("/documents/{document_id}/upload_version/", response_model=schemas.DocumentVersion, status_code=201)
-def upload_document_version_endpoint(
-    document_id: int,
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_user_in_company)
-):
-    """
-    Sube una nueva versión de un archivo para un documento existente,
-    verificando que el documento pertenezca a la compañía del usuario.
-    """
-    # Obtenemos el documento y sus relaciones para verificar la pertenencia
-    db_document = db.query(models.Document).options(
-        joinedload(models.Document.folder).joinedload(models.Folder.project)
-    ).filter(models.Document.id == document_id).first()
-
-    if not db_document:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El documento no existe.")
-
-    # Verificamos que el proyecto de la carpeta del documento pertenezca a la compañía del usuario
-    if db_document.folder.project.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="No autorizado para subir versiones a este documento."
-        )
-
-    return crud.create_new_document_version(db=db, file=file, document_id=document_id)
-
-@app.post("/contractors/", response_model=schemas.Contractor, status_code=201)
-def create_contractor_endpoint(
-    contractor_data: schemas.ContractorCreateRequest, 
+    project_update: schemas.ProjectUpdate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_company_user)
 ):
+    db_project = crud.update_project(
+        db=db, project_id=project_id, 
+        project_update=project_update, 
+        company_id=current_user.company_id
+    )
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+    return db_project
+
+@app.delete("/projects/{project_id}", status_code=204)
+def delete_project(
+    project_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    db_project = crud.delete_project_by_id( # La lógica de company_id ya está en el crud
+        db=db, project_id=project_id, company_id=current_user.company_id
+    )
+    if not db_project: raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+    return Response(status_code=204)
+
+@app.post("/projects/{project_id}/tasks/", response_model=schemas.Task, status_code=201)
+def create_task_for_project(
+    project_id: int, 
+    task: schemas.TaskCreate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.create_task(db=db, task=task, project_id=project_id, creator_id=current_user.id)
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def delete_task_endpoint(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    crud.delete_task(db=db, task_id=task_id, user=current_user)
+    return Response(status_code=204)
+
+@app.post("/projects/{project_id}/import-excel/", status_code=201)
+async def import_project_tasks_excel(
+    project_id: int, 
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Formato de archivo inválido.")
+    file_contents = await file.read()
+    try:
+        result = crud.import_tasks_from_excel(db=db, project_id=project_id, file_contents=file_contents)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
+
+app.post("/projects/{project_id}/contractors", response_model=schemas.Contractor, status_code=201)
+def create_contractor(
+    contractor_data: schemas.ContractorCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, contractor_data.project_id, current_user.company_id)
     db_contractor = crud.get_contractor_by_razon_social(
-        db, razon_social=contractor_data.razon_social, company_id=current_user.company_id
+        db, razon_social=contractor_data.razon_social, project_id=contractor_data.project_id
     )
     if db_contractor:
         raise HTTPException(status_code=400, detail="Ya existe un contratista con esta Razón Social")
-
-    contractor = schemas.ContractorCreate(
-        **contractor_data.model_dump(),
-        company_id=current_user.company_id
-    )
-
-    return crud.create_contractor(db=db, contractor=contractor)
+    
+    return crud.create_contractor(db=db, contractor=contractor_data)
 
 @app.get("/contractors/", response_model=List[schemas.Contractor])
-def read_contractors_endpoint(
+def read_all_company_contractors(
+    skip: int = 0, limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    contractors = crud.get_all_company_contractors(db, company_id=current_user.company_id, skip=skip, limit=limit)
+    return contractors
+
+@app.post("/projects/{project_id}/contractors/import-excel/", status_code=201)
+async def import_contractors(
+    project_id: int,
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Formato de archivo inválido")
+    file_contents = await file.read()
+    try:
+        result = crud.import_contractors_from_excel(
+            db=db, file_contents=file_contents, project_id=project_id
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
+
+@app.get("/projects/{project_id}/contractors", response_model=List[schemas.Contractor])
+def read_contractors(
+    project_id: int,
     skip: int = 0, limit: int = 100, 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_company_user)
 ):
-    contractors = crud.get_contractors(db, company_id=current_user.company_id, skip=skip, limit=limit)
-    return contractors
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.get_contractors(db, project_id=project_id, skip=skip, limit=limit)
+
+@app.get("/contractors/{contractor_id}", response_model=schemas.Contractor)
+def read_contractor_by_id(
+    contractor_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contractor = crud.get_contractor(db, contractor_id=contractor_id)
+    if not db_contractor:
+        raise HTTPException(status_code=404, detail="Contratista no encontrado")
+    get_project_for_user(db, db_contractor.project_id, current_user.company_id)
+    return db_contractor
+
+@app.put("/contractors/{contractor_id}", response_model=schemas.Contractor)
+def update_contractor(
+    contractor_id: int,
+    contractor_update: schemas.ContractorUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contractor = crud.update_contractor(db, contractor_id=contractor_id, contractor_update=contractor_update, user_company_id=current_user.company_id)
+    if not db_contractor:
+        raise HTTPException(status_code=404, detail="Contratista no encontrado")
+    return db_contractor
+
+@app.delete("/contractors/{contractor_id}", status_code=204)
+def delete_contractor(
+    contractor_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contractor = crud.delete_contractor(db, contractor_id=contractor_id, user_company_id=current_user.company_id)
+    if not db_contractor:
+        raise HTTPException(status_code=404, detail="Contratista no encontrado")
+    return Response(status_code=204)
+
+@app.post("/projects/{project_id}/work_items/", response_model=schemas.WorkItem, status_code=201)
+def create_work_item_for_project_endpoint(
+    project_id: int, 
+    work_item: schemas.WorkItemCreate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.create_work_item(db=db, work_item=work_item, project_id=project_id)
+@app.get("/projects/{project_id}/work_items/", response_model=List[schemas.WorkItem])
+def read_project_work_items_endpoint(
+    project_id: int, 
+    skip: int = 0, limit: int = 100, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    work_items = crud.get_project_work_items(db, project_id=project_id, skip=skip, limit=limit)
+    return work_items
+@app.get("/work_items/{work_item_id}", response_model=schemas.WorkItem)
+def read_work_item_by_id_endpoint(
+    work_item_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_work_item = crud.get_work_item(db, work_item_id=work_item_id)
+    if not db_work_item:
+        raise HTTPException(status_code=404, detail="Partida no encontrada")
+    get_project_for_user(db, db_work_item.project_id, current_user.company_id)
+    return db_work_item
+@app.put("/work_items/{work_item_id}", response_model=schemas.WorkItem)
+def update_work_item_endpoint(
+    work_item_id: int,
+    work_item_update: schemas.WorkItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_work_item = crud.get_work_item(db, work_item_id=work_item_id)
+    if not db_work_item:
+        raise HTTPException(status_code=404, detail="Partida no encontrada")
+    get_project_for_user(db, db_work_item.project_id, current_user.company_id)
+    db_work_item_updated = crud.update_work_item(db, work_item_id=work_item_id, work_item_update=work_item_update)
+    return db_work_item_updated
+@app.delete("/work_items/{work_item_id}", status_code=204)
+def delete_work_item_endpoint(
+    work_item_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_work_item = crud.get_work_item(db, work_item_id=work_item_id)
+    if not db_work_item:
+        raise HTTPException(status_code=404, detail="Partida no encontrada")
+    get_project_for_user(db, db_work_item.project_id, current_user.company_id)
+    crud.delete_work_item(db, work_item_id=work_item_id)
+    return Response(status_code=204)
+
+@app.post("/projects/{project_id}/contracts/", response_model=schemas.Contract, status_code=201)
+def create_contract_for_project_endpoint(
+    project_id: int, 
+    contract: schemas.ContractCreate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.create_contract(db=db, contract=contract, project_id=project_id)
+@app.get("/projects/{project_id}/contracts/", response_model=List[schemas.Contract])
+def read_project_contracts_endpoint(
+    project_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.get_project_contracts(db=db, project_id=project_id)
+@app.get("/contracts/{contract_id}", response_model=schemas.Contract)
+def read_contract_by_id_endpoint(
+    contract_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contract = crud.get_contract_details(db, contract_id=contract_id)
+    if not db_contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    get_project_for_user(db, db_contract.project_id, current_user.company_id)
+    return db_contract
+@app.put("/contracts/{contract_id}", response_model=schemas.Contract)
+def update_contract_endpoint(
+    contract_id: int,
+    contract_update: schemas.ContractUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contract = crud.get_contract(db, contract_id=contract_id)
+    if not db_contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    get_project_for_user(db, db_contract.project_id, current_user.company_id)
+    db_contract_updated = crud.update_contract(db, contract_id=contract_id, contract_update=contract_update)
+    return db_contract_updated
+@app.delete("/contracts/{contract_id}", status_code=204)
+def delete_contract_endpoint(
+    contract_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    db_contract = crud.get_contract(db, contract_id=contract_id)
+    if not db_contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    get_project_for_user(db, db_contract.project_id, current_user.company_id)
+    crud.delete_contract(db, contract_id=contract_id)
+    return Response(status_code=204)
+
+@app.post("/projects/{project_id}/import-contracts/", status_code=201)
+async def import_contracts_endpoint(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Formato de archivo inválido.")
+    
+    file_contents = await file.read()
+    try:
+        result = await run_in_threadpool(
+            crud.import_contracts_from_excel, db=db, project_id=project_id, file_contents=file_contents
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
+
+@app.get("/projects/{project_id}/export-contracts/")
+def export_contracts_endpoint(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    # Asegurarse que el proyecto pertenece al usuario
+    get_project_for_user(db, project_id, current_user.company_id)
+    try:
+        excel_bytes = crud.export_contracts_to_excel(db=db, project_id=project_id)
+        filename = f"proyecto_{project_id}_contratos.xlsx"
+        return StreamingResponse(
+            excel_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando el archivo de contratos: {e}")
+
+@app.post("/contracts/{contract_id}/items/", response_model=schemas.ContractItem)
+def create_contract_item_endpoint(
+    contract_id: int,
+    item: schemas.ContractItemCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contract = crud.get_contract(db, contract_id=contract_id)
+    if not db_contract or db_contract.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    return crud.create_contract_item(db=db, item=item, contract_id=contract_id)
+@app.put("/contract_items/{item_id}", response_model=schemas.ContractItem)
+def update_contract_item_endpoint(
+    item_id: int,
+    item_update: schemas.ContractItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_item = crud.get_contract_item(db, item_id=item_id)
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Item de contrato no encontrado")
+    get_project_for_user(db, db_item.contract.project_id, current_user.company_id)
+    return crud.update_contract_item(db, item_id=item_id, item_update=item_update)
+@app.delete("/contract_items/{item_id}", status_code=204)
+def delete_contract_item_endpoint(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_item = crud.get_contract_item(db, item_id=item_id)
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Item de contrato no encontrado")
+    get_project_for_user(db, db_item.contract.project_id, current_user.company_id)
+    crud.delete_contract_item(db, item_id=item_id)
+    return Response(status_code=204)
+@app.post("/contracts/{contract_id}/import_items/", status_code=201)
+async def import_contract_items_endpoint(
+    contract_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_contract = crud.get_contract_for_permission_check(db, contract_id=contract_id)
+    if not db_contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    
+    if current_user.role != "super_admin" and db_contract.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="No tiene permisos para modificar este contrato")
+
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Formato de archivo inválido.")
+    file_contents = await file.read()
+    try:
+        result = await run_in_threadpool(
+            crud.import_contract_items_from_excel, 
+            db=db, contract_id=contract_id, file_contents=file_contents
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
+@app.get("/contracts/{contract_id}/export_items/")
+def export_contract_items_endpoint(
+    contract_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contract = crud.get_contract(db, contract_id=contract_id)
+    if not db_contract or db_contract.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    try:
+        excel_bytes = crud.export_contract_items_to_excel(db=db, contract_id=contract_id)
+        filename = f"contrato_{db_contract.numero_contrato}_catalogo.xlsx"
+        return StreamingResponse(
+            excel_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando el archivo: {e}")
+
+@app.post("/projects/{project_id}/estimates/", response_model=schemas.Estimate, status_code=201)
+def create_estimate_for_project_endpoint(
+    project_id: int, 
+    estimate: schemas.EstimateCreate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.create_estimate(db=db, estimate=estimate, project_id=project_id)
+@app.get("/projects/{project_id}/estimates/", response_model=List[schemas.Estimate])
+def read_project_estimates_endpoint(
+    project_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.get_project_estimates(db=db, project_id=project_id)
+@app.get("/estimates/{estimate_id}", response_model=schemas.Estimate)
+def read_estimate_by_id_endpoint(
+    estimate_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_estimate = crud.get_estimate(db, estimate_id=estimate_id)
+    if not db_estimate:
+        raise HTTPException(status_code=404, detail="Estimación no encontrada")
+    get_project_for_user(db, db_estimate.project_id, current_user.company_id)
+    return db_estimate
+@app.put("/estimates/{estimate_id}", response_model=schemas.Estimate)
+def update_estimate_endpoint(
+    estimate_id: int,
+    estimate_update: schemas.EstimateUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_estimate = crud.get_estimate(db, estimate_id=estimate_id)
+    if not db_estimate:
+        raise HTTPException(status_code=404, detail="Estimación no encontrada")
+    get_project_for_user(db, db_estimate.project_id, current_user.company_id)
+    db_estimate_updated = crud.update_estimate(db, estimate_id=estimate_id, estimate_update=estimate_update)
+    return db_estimate_updated
+@app.delete("/estimates/{estimate_id}", status_code=204)
+def delete_estimate_endpoint(
+    estimate_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    db_estimate = crud.get_estimate(db, estimate_id=estimate_id)
+    if not db_estimate:
+        raise HTTPException(status_code=404, detail="Estimación no encontrada")
+    get_project_for_user(db, db_estimate.project_id, current_user.company_id) # Verifica pertenencia
+    crud.delete_estimate(db, estimate_id=estimate_id)
+    return Response(status_code=204)
+@app.post("/projects/{project_id}/import-estimates/", status_code=201)
+async def import_estimates_endpoint(
+    project_id: int,
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    if not file.filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Formato de archivo inválido.")
+    
+    file_contents = await file.read()
+    try:
+        result = await run_in_threadpool(crud.import_estimates_from_excel, db=db, project_id=project_id, file_contents=file_contents)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
+
+@app.get("/projects/{project_id}/export-estimates/")
+def export_estimates_endpoint(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    try:
+        excel_bytes = crud.export_estimates_to_excel(db=db, project_id=project_id)
+        filename = f"proyecto_{project_id}_estimaciones.xlsx"
+        return StreamingResponse(
+            excel_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando el archivo: {e}")
+
+@app.post("/estimates/{estimate_id}/items/", response_model=schemas.EstimateItem)
+def create_estimate_item_endpoint(
+    estimate_id: int,
+    item: schemas.EstimateItemCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_estimate = crud.get_estimate(db, estimate_id=estimate_id)
+    if not db_estimate or db_estimate.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Estimación no encontrada")
+    return crud.create_estimate_item(db=db, item=item, estimate_id=estimate_id)
+@app.put("/estimate_items/{item_id}", response_model=schemas.EstimateItem)
+def update_estimate_item_endpoint(
+    item_id: int,
+    item_update: schemas.EstimateItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_item = crud.get_estimate_item(db, item_id=item_id)
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Item de estimación no encontrado")
+    get_project_for_user(db, db_item.estimate.project_id, current_user.company_id)
+    return crud.update_estimate_item(db, item_id=item_id, item_update=item_update)
+@app.delete("/estimate_items/{item_id}", status_code=204)
+def delete_estimate_item_endpoint(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_item = crud.get_estimate_item(db, item_id=item_id)
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Item de estimación no encontrado")
+    get_project_for_user(db, db_item.estimate.project_id, current_user.company_id)
+    crud.delete_estimate_item(db, item_id=item_id)
+    return Response(status_code=204)
+
+@app.post("/projects/{project_id}/folders/", response_model=schemas.Folder)
+def create_folder_endpoint(
+    project_id: int,
+    folder: schemas.FolderCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.create_folder(db=db, folder=folder, project_id=project_id)
+@app.get("/folders/{folder_id}", response_model=schemas.Folder)
+def get_folder_contents_endpoint(
+    folder_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_folder = crud.get_folder_contents(db=db, folder_id=folder_id)
+    if not db_folder:
+        raise HTTPException(status_code=404, detail="Carpeta no encontrada")
+    if current_user.role != "super_admin":
+        get_project_for_user(db, db_folder.project_id, current_user.company_id)
+    return db_folder
+@app.put("/folders/{folder_id}/rename", response_model=schemas.Folder)
+def rename_folder_endpoint(
+    folder_id: int,
+    folder_update: schemas.FolderBase,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_folder = crud.get_folder_contents(db, folder_id=folder_id)
+    if not db_folder:
+        raise HTTPException(status_code=404, detail="Carpeta no encontrada")
+    if current_user.role != "super_admin":
+        get_project_for_user(db, db_folder.project_id, current_user.company_id)
+    db_folder_renamed = crud.rename_folder(db=db, folder_id=folder_id, new_name=folder_update.name)
+    return db_folder_renamed
+@app.delete("/folders/{folder_id}", status_code=204)
+def delete_folder_endpoint(
+    folder_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_folder = crud.get_folder_contents(db, folder_id=folder_id)
+    if not db_folder:
+        raise HTTPException(status_code=404, detail="Carpeta no encontrada")
+    if current_user.role != "super_admin":
+        get_project_for_user(db, db_folder.project_id, current_user.company_id)
+    try:
+        crud.delete_folder(db=db, folder_id=folder_id)
+        return Response(status_code=204)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error inesperado: {e}")
+@app.post("/documents/", response_model=schemas.Document)
+def create_document_concept_endpoint(
+    document: schemas.DocumentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_folder = crud.get_folder_contents(db, folder_id=document.folder_id)
+    if not db_folder:
+        raise HTTPException(status_code=404, detail="Carpeta no encontrada")
+    if current_user.role != "super_admin":
+        get_project_for_user(db, db_folder.project_id, current_user.company_id)
+    return crud.create_document_concept(db=db, document=document)
+
+@app.delete("/documents/{document_id}", status_code=204)
+def delete_document_endpoint(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_doc = crud.get_document_concept_with_project(db, document_id)
+    if not db_doc:
+        raise HTTPException(status_code=404, detail="Documento no encontrado")
+    if current_user.role != "super_admin":
+        get_project_for_user(db, db_doc.folder.project_id, current_user.company_id)
+    crud.delete_document_and_versions(db=db, document_id=document_id)
+    return Response(status_code=204)
+
+@app.post("/documents/{document_id}/upload_version/", response_model=schemas.DocumentVersion)
+async def upload_document_version_endpoint(
+    document_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_doc = crud.get_document_concept_with_project(db, document_id)
+    if not db_doc:
+        raise HTTPException(status_code=404, detail="Documento no encontrado")
+    if current_user.role != "super_admin":
+        get_project_for_user(db, db_doc.folder.project_id, current_user.company_id)        
+    db_version = await run_in_threadpool(crud.create_new_document_version, db=db, file=file, document_id=document_id)
+    if not db_version:
+        raise HTTPException(status_code=404, detail="El 'Documento' conceptual no existe")
+    return db_version
+@app.get("/documents/file/{version_id}")
+def get_document_file(
+    version_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_active_user)
+):
+    db_version = crud.get_document_version(db, version_id=version_id)
+    if not db_version:
+        raise HTTPException(status_code=404, detail="Versión del documento no encontrada")    
+    if current_user.role != "super_admin":
+        db_doc = crud.get_document_concept_with_project(db, db_version.document_id)
+        get_project_for_user(db, db_doc.folder.project_id, current_user.company_id)    
+    file_path = db_version.file_path
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Archivo no encontrado en el servidor")
+    return FileResponse(path=file_path, media_type=db_version.file_type, filename=db_version.filename)
+@app.post("/link/document/{document_id}/contract/{contract_id}")
+def link_document_contract_endpoint(
+    document_id: int,
+    contract_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    db_contract = crud.get_contract(db, contract_id)
+    if not db_contract or db_contract.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    crud.link_document_to_contract(db=db, document_id=document_id, contract_id=contract_id)
+    return {"message": "Documento vinculado exitosamente al contrato."}
