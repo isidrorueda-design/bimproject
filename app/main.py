@@ -10,7 +10,7 @@ from datetime import timedelta
 from typing import List, Optional
 from . import crud, models, schemas, security, dependencies
 from .database import SessionLocal, engine, get_db
-from .routers import bcf
+from .routers import bcf, ifc
 models.Base.metadata.create_all(bind=engine)
 app = FastAPI(title="ConTech PM API")
 @app.on_event("startup")
@@ -46,6 +46,7 @@ app.add_middleware(
 )
 
 app.include_router(bcf.router)
+app.include_router(ifc.router)
 
 @app.post("/login", response_model=schemas.Token)
 def login_for_access_token(
@@ -208,20 +209,22 @@ async def import_project_tasks_excel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
 
-app.post("/projects/{project_id}/contractors", response_model=schemas.Contractor, status_code=201)
+@app.post("/projects/{project_id}/contractors", response_model=schemas.Contractor, status_code=201)
 def create_contractor(
-    contractor_data: schemas.ContractorCreate,
+    project_id: int,
+    contractor_data: schemas.ContractorBase,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_company_user)
 ):
-    get_project_for_user(db, contractor_data.project_id, current_user.company_id)
+    get_project_for_user(db, project_id, current_user.company_id)
     db_contractor = crud.get_contractor_by_razon_social(
-        db, razon_social=contractor_data.razon_social, project_id=contractor_data.project_id
+        db, razon_social=contractor_data.razon_social, project_id=project_id
     )
     if db_contractor:
         raise HTTPException(status_code=400, detail="Ya existe un contratista con esta Razón Social")
     
-    return crud.create_contractor(db=db, contractor=contractor_data)
+    contractor_to_create = schemas.ContractorCreate(**contractor_data.model_dump(), project_id=project_id)
+    return crud.create_contractor(db=db, contractor=contractor_to_create)
 
 @app.get("/contractors/", response_model=List[schemas.Contractor])
 def read_all_company_contractors(
@@ -408,13 +411,14 @@ def delete_contract_endpoint(
 
 @app.post("/projects/{project_id}/import-contracts/", status_code=201)
 async def import_contracts_endpoint(
+    project_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_company_user)
 ):
     get_project_for_user(db, project_id, current_user.company_id)
     if not file.filename.endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Formato de archivo inválido.")
+        raise HTTPException(status_code=400, detail="Formato de archivo inválido. Se requiere .xlsx")
     
     file_contents = await file.read()
     try:

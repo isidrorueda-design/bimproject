@@ -16,7 +16,6 @@ class CompanyCreate(CompanyBase):
 class Company(CompanyBase):
     id: int; users: List[User] = []
     class Config: from_attributes = True
-
 class TaskBase(BaseModel):
     name: str; description: Optional[str] = None; start_date: date; end_date: date   
     parent_id: Optional[int] = None; priority: Optional[int] = 2; responsible_user_id: Optional[int] = None
@@ -156,11 +155,18 @@ class EstimateBase(BaseModel):
     amortizacion_anticipo: Optional[float] = 0.0
     fondo_garantia: Optional[float] = 0.0
     otras_retenciones: Optional[float] = 0.0
-    otras_deductivas: Optional[float] = 0.0
+    otras_deductivas: Optional[float] = 0.0    
 class EstimateCreate(EstimateBase):
-    pass
+    porcentaje_fondo_garantia: Optional[float] = None # Campo temporal para el cálculo
+
 class EstimateUpdate(BaseModel):
     numero_estimacion: Optional[str] = None; fecha: Optional[date] = None; monto_estimado_manual: Optional[float] = None; amortizacion_anticipo: Optional[float] = None; fondo_garantia: Optional[float] = None; otras_retenciones: Optional[float] = None; otras_deductivas: Optional[float] = None
+    porcentaje_fondo_garantia: Optional[float] = None # Campo temporal para el cálculo
+
+class EstimatePartialUpdate(BaseModel):
+    amortizacion_anticipo: Optional[float] = None
+    class Config:
+        from_attributes = True
 
 class EstimateSimple(EstimateBase):
     id: int; project_id: int
@@ -259,10 +265,12 @@ class Contract(ContractBase):
     @computed_field
     @property
     def total_contratado_vigente(self) -> float:
-        total_items = self.total_ordinario + self.total_extraordinario
+        # Aseguramos que los valores no sean None antes de sumar
+        total_items = (self.total_ordinario or 0.0) + (self.total_extraordinario or 0.0)
         if total_items > 1.0: 
             return total_items
-        return self.monto_contratado_manual
+        # Si no hay items, usamos el monto manual, asegurando que no sea None
+        return self.monto_contratado_manual or 0.0
     @computed_field
     @property
     def total_estimado_acumulado(self) -> float:
@@ -300,9 +308,15 @@ class Contract(ContractBase):
     class Config:
         from_attributes = True
 
+class ContractForEstimate(ContractBase): # Schema simple para evitar recursión
+    id: int
+    project_id: int
+    contractor: Contractor
+    class Config: from_attributes = True
+
 class Estimate(EstimateBase):
     id: int; project_id: int
-    contract: Contract 
+    contract: ContractForEstimate
     estimate_items: List[EstimateItem] = []
     
     @computed_field
@@ -317,18 +331,37 @@ class Estimate(EstimateBase):
 
     @computed_field
     @property
-    def subtotal(self) -> float:
-        return self.total_estimado
+    def amortizacion_calculada(self) -> float:
+        try:
+            contract_schema = Contract.from_orm(self.contract)
+            total_con_iva = contract_schema.total_con_iva
+        except Exception:
+            total_con_iva = 0
+        if total_con_iva and total_con_iva > 0 and self.contract.anticipo:
+            return self.total_estimado * (self.contract.anticipo / total_con_iva)
+        return 0.0
 
     @computed_field
     @property
+    def subtotal(self) -> float:
+        return self.total_estimado
+    
+    @computed_field
+    @property
     def total_deducciones(self) -> float:
-        return self.amortizacion_anticipo + self.fondo_garantia + self.otras_retenciones + self.otras_deductivas
+        amortizacion_a_usar = self.amortizacion_anticipo if self.amortizacion_anticipo is not None else self.amortizacion_calculada
+        
+        garantia = self.fondo_garantia or 0.0
+        retenciones = self.otras_retenciones or 0.0
+        deductivas = self.otras_deductivas or 0.0
+        return amortizacion_a_usar + garantia + retenciones + deductivas
 
     @computed_field
     @property
     def total_a_pagar(self) -> float:
-        return self.subtotal - self.total_deducciones
+        subtotal_neto = self.subtotal - self.total_deducciones
+        iva = subtotal_neto * 0.16 if self.contract.aplica_iva else 0.0
+        return subtotal_neto + iva
     class Config: from_attributes = True
 
 class ProjectBase(BaseModel):
@@ -348,15 +381,13 @@ class Project(ProjectBase):
     work_items: List["WorkItem"] = []
     contracts: List[Contract] = []
     estimates: List[Estimate] = []
-    contractors: List[Contractor] = [] # Aseguramos que la lista de contratistas esté aquí
+    contractors: List[Contractor] = []
     class Config:
         from_attributes = True
-
 class BCFComponentBase(BaseModel):
     ifc_guid: str
     originating_system: Optional[str] = None
     authoring_tool_id: Optional[str] = None
-
 class BCFComponentCreate(BCFComponentBase):
     pass
 
@@ -394,14 +425,12 @@ class BCFCommentBase(BaseModel):
 
 class BCFCommentCreate(BCFCommentBase):
     pass
-
 class BCFComment(BCFCommentBase):
     guid: str
     topic_guid: str
     date: datetime
     author: str
     class Config: from_attributes = True
-
 class BCFTopicBase(BaseModel):
     title: str
     topic_type: Optional[str] = "Issue"
@@ -409,11 +438,9 @@ class BCFTopicBase(BaseModel):
     description: Optional[str] = None
     priority: Optional[str] = None
     assigned_to: Optional[str] = None
-
 class BCFTopicCreate(BCFTopicBase):
     viewpoints: List[BCFViewpointCreate] = []
     comments: List[BCFCommentCreate] = []
-
 class BCFTopic(BCFTopicBase):
     guid: str
     project_id: int
@@ -424,7 +451,6 @@ class BCFTopic(BCFTopicBase):
     viewpoints: List[BCFViewpoint] = []
     comments: List[BCFComment] = []
     class Config: from_attributes = True
-
 class BCFTopicUpdate(BaseModel):
     title: Optional[str] = None
     topic_type: Optional[str] = None

@@ -79,10 +79,9 @@ def update_project(db: Session, project_id: int, project_update: schemas.Project
         models.Project.id == project_id, models.Project.company_id == company_id
     ).first()
     if not db_project: return None
-    update_data = project_update.model_dump(exclude_unset=True)
+    update_data = project_update.model_dump(exclude_none=True)
     for key, value in update_data.items(): setattr(db_project, key, value)
     db.add(db_project); db.commit(); db.refresh(db_project); return db_project
-
 def create_project(db: Session, project: schemas.ProjectCreate):
     db_project = models.Project(**project.model_dump())
     db.add(db_project)
@@ -97,25 +96,21 @@ def get_task(db: Session, task_id: int):
 def update_task(db: Session, task_id: int, task_update: schemas.TaskUpdate):
     db_task = get_task(db, task_id=task_id)
     if not db_task: return None
-    update_data = task_update.model_dump(exclude_unset=True)
+    update_data = task_update.model_dump(exclude_none=True)
     for key, value in update_data.items(): setattr(db_task, key, value)
     db.add(db_task); db.commit(); db.refresh(db_task); return db_task
 def delete_task(db: Session, task_id: int, user: models.User):
     db_task = get_task(db, task_id=task_id)
     if not db_task:
         raise HTTPException(status_code=404, detail="Tarea no encontrada")
-
-    # Un admin puede borrar cualquier tarea de su compañía
     if user.role == 'admin' and db_task.project.company_id == user.company_id:
         db.delete(db_task)
         db.commit()
         return {"ok": True}
-    # Un usuario normal solo puede borrar tareas creadas por él
     if user.role == 'user' and db_task.creator_id == user.id:
         db.delete(db_task)
         db.commit()
         return {"ok": True}
-
     raise HTTPException(status_code=403, detail="No tiene permisos para eliminar esta tarea")
 def get_project_tasks(db: Session, project_id: int):
     return db.query(models.Task).filter(models.Task.project_id == project_id).all()
@@ -187,7 +182,7 @@ def update_contractor(db: Session, contractor_id: int, contractor_update: schema
     if not db_contractor: return None
     if db_contractor.project.company_id != user_company_id:
         raise HTTPException(status_code=403, detail="No tiene permisos sobre este contratista")
-    update_data = contractor_update.model_dump(exclude_unset=True)
+    update_data = contractor_update.model_dump(exclude_none=True)
     for key, value in update_data.items(): setattr(db_contractor, key, value)
     db.add(db_contractor); db.commit(); db.refresh(db_contractor); return db_contractor
 
@@ -247,7 +242,7 @@ def get_work_item(db: Session, work_item_id: int):
 def update_work_item(db: Session, work_item_id: int, work_item_update: schemas.WorkItemUpdate):
     db_work_item = get_work_item(db, work_item_id=work_item_id)
     if not db_work_item: return None
-    update_data = work_item_update.model_dump(exclude_unset=True)
+    update_data = work_item_update.model_dump(exclude_none=True)
     for key, value in update_data.items(): setattr(db_work_item, key, value)
     db.add(db_work_item); db.commit(); db.refresh(db_work_item); return db_work_item
 def delete_work_item(db: Session, work_item_id: int):
@@ -274,6 +269,9 @@ def get_contract(db: Session, contract_id: int):
         joinedload(models.Contract.project) 
     ).filter(models.Contract.id == contract_id).first()
 
+def get_contract_by_number(db: Session, project_id: int, numero_contrato: str):
+    return db.query(models.Contract).filter(models.Contract.project_id == project_id, models.Contract.numero_contrato == numero_contrato).first()
+
 def get_contract_for_permission_check(db: Session, contract_id: int):
     """
     Obtiene un contrato simple para validaciones de permisos.
@@ -299,13 +297,19 @@ def get_contract_details(db: Session, contract_id: int):
 def update_contract(db: Session, contract_id: int, contract_update: schemas.ContractUpdate):  
     db_contract = db.query(models.Contract).filter(models.Contract.id == contract_id).first()
     if not db_contract: return None
-    update_data = contract_update.model_dump(exclude_unset=True)
+    update_data = contract_update.model_dump(exclude_none=True)
     if 'work_item_id' in update_data:
         work_item_id = update_data.pop('work_item_id')
         db_contract.work_item_id = work_item_id
     for key, value in update_data.items():
         setattr(db_contract, key, value)
     db.add(db_contract); db.commit(); db.refresh(db_contract); return get_contract(db, contract_id=contract_id)
+
+def delete_contract(db: Session, contract_id: int):
+    db_contract = get_contract(db, contract_id=contract_id)
+    if not db_contract: return None
+    db.delete(db_contract)
+    db.commit()
 
 def create_contract_item(db: Session, item: schemas.ContractItemCreate, contract_id: int):
     db_item = models.ContractItem(**item.model_dump(), contract_id=contract_id)
@@ -315,7 +319,7 @@ def get_contract_item(db: Session, item_id: int):
 def update_contract_item(db: Session, item_id: int, item_update: schemas.ContractItemUpdate):
     db_item = get_contract_item(db, item_id=item_id)
     if not db_item: return None
-    update_data = item_update.model_dump(exclude_unset=True)
+    update_data = item_update.model_dump(exclude_none=True)
     for key, value in update_data.items(): setattr(db_item, key, value)
     db.add(db_item); db.commit(); db.refresh(db_item); return db_item
 def delete_contract_item(db: Session, item_id: int):
@@ -331,6 +335,7 @@ def export_contracts_to_excel(db: Session, project_id: int):
 def import_contracts_from_excel(db: Session, project_id: int, file_contents: bytes):
     df = pd.read_excel(io.BytesIO(file_contents)).fillna('')
     created_count = 0
+    updated_count = 0
     errors = []
     # Obtener el company_id desde el proyecto
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
@@ -351,22 +356,39 @@ def import_contracts_from_excel(db: Session, project_id: int, file_contents: byt
                 continue
 
             work_item_id = None
-            work_item_code = str(row.get('Partida', '')).strip()
-            if work_item_code:
-                work_item = db.query(models.WorkItem).filter(models.WorkItem.project_id == project_id, models.WorkItem.item_code == work_item_code).first()
+            work_item_description = str(row.get('Partida', '')).strip()
+            if work_item_description:
+                work_item = db.query(models.WorkItem).filter(models.WorkItem.project_id == project_id, models.WorkItem.description == work_item_description).first()
                 if work_item:
                     work_item_id = work_item.id
                 else:
-                    errors.append(f"Fila {index + 2}: No se encontró la partida con código '{work_item_code}' en este proyecto.")
+                    errors.append(f"Fila {index + 2}: No se encontró la partida con descripción '{work_item_description}' en este proyecto.")
 
-            contract_data = schemas.ContractCreate(
-                numero_contrato=numero_contrato, contractor_id=contractor.id, trabajos=str(row.get('Trabajo', '')), aplica_iva=str(row.get('Aplica IVA', 'SI')).strip().upper() == 'SI', monto_contratado_manual=float(row.get('Monto Contratado (Manual)') or 0.0), anticipo=float(row.get('Anticipo') or 0.0), status=str(row.get('Status') or 'Borrador'), external_url=str(row.get('URL Externa', '')), work_item_id=work_item_id
-            )
-            create_contract(db=db, contract=contract_data, project_id=project_id)
-            created_count += 1
+            # --- LÓGICA DE ACTUALIZAR O CREAR ---
+            existing_contract = get_contract_by_number(db, project_id=project_id, numero_contrato=numero_contrato)
+
+            if existing_contract:
+                # Si existe, se actualiza
+                update_data = schemas.ContractUpdate(
+                    contractor_id=contractor.id,
+                    trabajos=str(row.get('Trabajo', '')),
+                    aplica_iva=str(row.get('Aplica IVA', 'SI')).strip().upper() == 'SI',
+                    monto_contratado_manual=float(row.get('Monto Contratado (Manual)') or 0.0),
+                    anticipo=float(row.get('Anticipo') or 0.0),
+                    status=str(row.get('Status') or 'Borrador'),
+                    external_url=str(row.get('URL Externa', '')),
+                    work_item_id=work_item_id
+                )
+                update_contract(db, contract_id=existing_contract.id, contract_update=update_data)
+                updated_count += 1
+            else:
+                # Si no existe, se crea
+                contract_data = schemas.ContractCreate(numero_contrato=numero_contrato, contractor_id=contractor.id, trabajos=str(row.get('Trabajo', '')), aplica_iva=str(row.get('Aplica IVA', 'SI')).strip().upper() == 'SI', monto_contratado_manual=float(row.get('Monto Contratado (Manual)') or 0.0), anticipo=float(row.get('Anticipo') or 0.0), status=str(row.get('Status') or 'Borrador'), external_url=str(row.get('URL Externa', '')), work_item_id=work_item_id)
+                create_contract(db=db, contract=contract_data, project_id=project_id)
+                created_count += 1
         except Exception as e:
             errors.append(f"Fila {index + 2}: Error inesperado - {e}")
-    return {"message": f"{created_count} contratos creados.", "errors": errors}
+    return {"message": f"{created_count} contratos creados, {updated_count} actualizados.", "errors": errors}
 
     data_list = []
     for contract in db_contracts:
@@ -481,8 +503,20 @@ def import_contract_items_from_excel(db: Session, contract_id: int, file_content
     }
 
 def create_estimate(db: Session, estimate: schemas.EstimateCreate, project_id: int):
-    db_estimate = models.Estimate(**estimate.model_dump(), project_id=project_id)
-    db.add(db_estimate); db.commit(); db.refresh(db_estimate); return get_estimate(db, db_estimate.id)
+    estimate_data = estimate.model_dump(exclude={'porcentaje_fondo_garantia'})
+    db_estimate = models.Estimate(**estimate_data, project_id=project_id)
+
+    # Lógica de cálculo para el fondo de garantía al crear
+    if estimate.porcentaje_fondo_garantia is not None:
+        monto_base = estimate.monto_estimado_manual or 0.0
+        porcentaje = estimate.porcentaje_fondo_garantia / 100.0 # Convertir 5% a 0.05
+        db_estimate.fondo_garantia = monto_base * porcentaje
+
+    db.add(db_estimate)
+    db.commit()
+    db.refresh(db_estimate)
+    return get_estimate(db, db_estimate.id)
+
 def get_project_estimates(db: Session, project_id: int):
     return db.query(models.Estimate).filter(models.Estimate.project_id == project_id).options(
         joinedload(models.Estimate.contract), # Carga el contrato de la estimación
@@ -503,9 +537,38 @@ def get_estimate(db: Session, estimate_id: int):
 def update_estimate(db: Session, estimate_id: int, estimate_update: schemas.EstimateUpdate):
     db_estimate = db.query(models.Estimate).filter(models.Estimate.id == estimate_id).first()
     if not db_estimate: return None
-    update_data = estimate_update.model_dump(exclude_unset=True)
+
+    # Extraer el porcentaje antes de actualizar el resto
+    porcentaje_fg = estimate_update.porcentaje_fondo_garantia
+    update_data = estimate_update.model_dump(exclude_none=True, exclude={'porcentaje_fondo_garantia'})
+
     for key, value in update_data.items(): setattr(db_estimate, key, value)
-    db.add(db_estimate); db.commit(); db.refresh(db_estimate); return get_estimate(db, estimate_id=estimate_id)
+
+    # === LÓGICA DE RECÁLCULO DEL FONDO DE GARANTÍA ===
+    if porcentaje_fg is not None:
+        # Calculamos el total_estimado basado en los items o el monto manual
+        total_items = db.query(func.sum(models.EstimateItem.cantidad_estimada * models.ContractItem.precio_unitario))\
+            .join(models.ContractItem, models.EstimateItem.contract_item_id == models.ContractItem.id)\
+            .filter(models.EstimateItem.estimate_id == estimate_id).scalar() or 0.0
+
+        monto_base = total_items if total_items > 0 else (db_estimate.monto_estimado_manual or 0.0)
+        porcentaje = porcentaje_fg / 100.0 # Convertir 5% a 0.05
+        
+        # Actualizamos el campo del monto en el objeto de la base de datos.
+        db_estimate.fondo_garantia = monto_base * porcentaje
+        
+    db.add(db_estimate)
+    db.commit()
+    db.refresh(db_estimate)
+    return get_estimate(db, estimate_id=estimate_id)
+
+def partial_update_estimate(db: Session, db_estimate: models.Estimate, estimate_update: schemas.EstimatePartialUpdate):
+    update_data = estimate_update.model_dump(exclude_none=True)
+    for key, value in update_data.items():
+        setattr(db_estimate, key, value)
+    db.add(db_estimate); db.commit(); db.refresh(db_estimate)
+    return db_estimate
+
 def delete_estimate(db: Session, estimate_id: int):
     db_estimate = get_estimate(db, estimate_id=estimate_id)
     if not db_estimate: return None
@@ -518,7 +581,6 @@ def export_estimates_to_excel(db: Session, project_id: int):
 
     data_list = []
     for estimate in db_estimates:
-        # Convert to Pydantic schema to use computed fields
         schema_estimate = schemas.Estimate.from_orm(estimate)
         data_list.append({
             "Numero Estimacion": schema_estimate.numero_estimacion,
@@ -722,8 +784,6 @@ def link_document_to_work_item(db: Session, document_id: int, work_item_id: int)
     statement = models.document_workitem_link.insert().values(document_id=document_id, work_item_id=work_item_id)
     db.execute(statement); db.commit(); return True
 
-# --- BCF CRUD Functions ---
-
 def get_bcf_topics_by_project(db: Session, project_id: int):
     return db.query(models.BCFTopic).filter(models.BCFTopic.project_id == project_id).all()
 
@@ -741,7 +801,6 @@ def create_bcf_topic(db: Session, topic_data: schemas.BCFTopicCreate, project_id
         modified_author=author_email
     )
     db.add(db_topic)
-    # Es necesario hacer un flush para obtener el GUID del topic antes de crear los hijos
     db.flush()
 
     for viewpoint_data in topic_data.viewpoints:
@@ -764,7 +823,7 @@ def create_bcf_topic(db: Session, topic_data: schemas.BCFTopicCreate, project_id
 def update_bcf_topic(db: Session, topic_guid: str, topic_update: schemas.BCFTopicUpdate, author_email: str):
     db_topic = get_bcf_topic(db, topic_guid=topic_guid)
     if not db_topic: return None
-    update_data = topic_update.model_dump(exclude_unset=True)
+    update_data = topic_update.model_dump(exclude_none=True)
     for key, value in update_data.items(): setattr(db_topic, key, value)
     db_topic.modified_author = author_email
     db.add(db_topic); db.commit(); db.refresh(db_topic); return db_topic

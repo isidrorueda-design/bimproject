@@ -17,7 +17,6 @@ class Company(Base):
     name = Column(String, unique=True, index=True, nullable=False)
     users = relationship("User", back_populates="company")
     projects = relationship("Project", back_populates="company")
-
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -30,7 +29,6 @@ class User(Base):
     responsible_tasks = relationship("Task", foreign_keys="[Task.responsible_user_id]", back_populates="responsible_user")
     created_tasks = relationship("Task", foreign_keys="[Task.creator_id]", back_populates="creator")
 
-# --- TABLAS DE PROYECTO ---
 class Project(Base):
     __tablename__ = "projects"    
     id = Column(Integer, primary_key=True, index=True)

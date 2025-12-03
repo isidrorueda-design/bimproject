@@ -26,4 +26,4 @@ pip-delete-this-directory.txt
 Thumbs.db
 
 # Archivos de entorno (si los usas para guardar secretos)
-.env
+.envuploads/
