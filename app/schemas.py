@@ -15,7 +15,45 @@ class CompanyCreate(CompanyBase):
     pass
 class Company(CompanyBase):
     id: int; users: List[User] = []
+    id: int; users: List[User] = []
     class Config: from_attributes = True
+
+class ConceptBase(BaseModel):
+    code: str
+    description: str
+    unit: str
+    unit_price: float
+
+class ConceptCreate(ConceptBase):
+    company_id: int
+
+class ConceptUpdate(BaseModel):
+    code: Optional[str] = None
+    description: Optional[str] = None
+    unit: Optional[str] = None
+    unit_price: Optional[float] = None
+
+class Concept(ConceptBase):
+    id: int
+    company_id: int
+    class Config: from_attributes = True
+
+class TaskConceptBase(BaseModel):
+    concept_id: int
+    quantity: float
+
+class TaskConceptCreate(TaskConceptBase):
+    pass
+
+class TaskConcept(TaskConceptBase):
+    id: int
+    task_id: int
+    amount: float
+    concept: Concept
+    class Config: from_attributes = True
+
+
+
 class TaskBase(BaseModel):
     name: str; description: Optional[str] = None; start_date: date; end_date: date   
     parent_id: Optional[int] = None; priority: Optional[int] = 2; responsible_user_id: Optional[int] = None
@@ -25,6 +63,9 @@ class TaskCreate(TaskBase):
     pass
 class Task(TaskBase):
     id: int; project_id: int; creator_id: Optional[int] = None; subtasks: List["Task"] = []; responsible_user: Optional[User] = None
+    weight: float = 1.0
+    estimated_cost: float = 0.0
+    concepts: List[TaskConcept] = []
     class Config: from_attributes = True
 class TaskUpdate(BaseModel):
     name: Optional[str] = None; description: Optional[str] = None; start_date: Optional[date] = None
@@ -71,11 +112,11 @@ class BimElement(BimElementBase):
 class WorkItemBase(BaseModel):
     item_code: str
     description: Optional[str] = None
-    presupuesto_base: float = 0.0
+    presupuesto_base: float = 0.0; planned_start_date: Optional[date] = None; planned_end_date: Optional[date] = None; real_start_date: Optional[date] = None; real_end_date: Optional[date] = None; related_task_id: Optional[int] = None
 class WorkItemCreate(WorkItemBase):
     pass
 class WorkItemUpdate(BaseModel):
-    item_code: Optional[str] = None; description: Optional[str] = None; presupuesto_base: Optional[float] = None
+    item_code: Optional[str] = None; description: Optional[str] = None; presupuesto_base: Optional[float] = None; planned_start_date: Optional[date] = None; planned_end_date: Optional[date] = None; real_start_date: Optional[date] = None; real_end_date: Optional[date] = None; related_task_id: Optional[int] = None
 class WorkItemSimple(WorkItemBase):
     id: int; project_id: int
     class Config: from_attributes = True
@@ -98,6 +139,7 @@ class ContractItemBase(BaseModel):
     is_group: bool = False; parent_id: Optional[int] = None
     precio_unitario: float = 0.0; cantidad_contratada: float = 0.0
     cantidad_aditiva: float = 0.0; cantidad_deductiva: float = 0.0
+    task_id: Optional[int] = None
 class ContractItemCreate(ContractItemBase):
     pass
 class ContractItemUpdate(BaseModel):
@@ -106,7 +148,7 @@ class ContractItemUpdate(BaseModel):
     tipo_concepto: Optional[str] = None; is_group: Optional[bool] = None
     parent_id: Optional[int] = None; precio_unitario: Optional[float] = None
     cantidad_contratada: Optional[float] = None; cantidad_aditiva: Optional[float] = None
-    cantidad_deductiva: Optional[float] = None
+    cantidad_deductiva: Optional[float] = None; task_id: Optional[int] = None
 
 class ContractItem(ContractItemBase):
     id: int
@@ -138,6 +180,20 @@ class ContractItem(ContractItemBase):
     def avance_financiero_pct(self) -> float:
         if self.cantidad_total_vigente == 0: return 0.0
         return (self.cantidad_estimada_acumulada / self.cantidad_total_vigente) * 100
+    class Config:
+        from_attributes = True
+
+class TaskCostCreate(BaseModel):
+    amount: float
+    description: str
+
+class TaskCost(BaseModel):
+    id: int
+    amount: float
+    description: Optional[str] = None
+    date: Optional[date] = None 
+    contract_item: Optional[ContractItemBase] = None
+    
     class Config:
         from_attributes = True
 
@@ -186,6 +242,9 @@ class ContractBase(BaseModel):
     numero_contrato: str; contractor_id: int; trabajos: Optional[str] = None; aplica_iva: bool = True; monto_contratado_manual: Optional[float] = 0.0; anticipo: Optional[float] = 0.0
     dms_folder_id: Optional[int] = None; status: Optional[str] = "Borrador"; external_url: Optional[str] = None
     work_item_id: Optional[int] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    avance_fisico: Optional[float] = 0.0
 class ContractCreate(ContractBase):
     pass
 class ContractUpdate(BaseModel):
@@ -193,6 +252,7 @@ class ContractUpdate(BaseModel):
     anticipo: Optional[float] = None
     dms_folder_id: Optional[int] = None
     status: Optional[str] = None; external_url: Optional[str] = None; work_item_id: Optional[int] = None
+    start_date: Optional[date] = None; end_date: Optional[date] = None; avance_fisico: Optional[float] = None
 
 class ContractSimple(ContractBase):
     id: int
@@ -292,12 +352,10 @@ class Contract(ContractBase):
         if not self.aplica_iva:
             return 0.0
         return self.total_contratado_vigente * 0.16
-
     @computed_field
     @property
     def total_con_iva(self) -> float:
         return self.total_contratado_vigente + self.iva
-
     @computed_field
     @property
     def progress(self) -> float:
@@ -307,18 +365,15 @@ class Contract(ContractBase):
         return round(avance, 2)
     class Config:
         from_attributes = True
-
-class ContractForEstimate(ContractBase): # Schema simple para evitar recursión
+class ContractForEstimate(ContractBase):
     id: int
     project_id: int
     contractor: Contractor
     class Config: from_attributes = True
-
 class Estimate(EstimateBase):
     id: int; project_id: int
     contract: ContractForEstimate
-    estimate_items: List[EstimateItem] = []
-    
+    estimate_items: List[EstimateItem] = []    
     @computed_field
     @property
     def total_items_calculado(self) -> float:
@@ -328,7 +383,6 @@ class Estimate(EstimateBase):
     def total_estimado(self) -> float:
         if self.total_items_calculado > 0: return self.total_items_calculado
         return self.monto_estimado_manual
-
     @computed_field
     @property
     def amortizacion_calculada(self) -> float:
@@ -340,7 +394,6 @@ class Estimate(EstimateBase):
         if total_con_iva and total_con_iva > 0 and self.contract.anticipo:
             return self.total_estimado * (self.contract.anticipo / total_con_iva)
         return 0.0
-
     @computed_field
     @property
     def subtotal(self) -> float:
@@ -390,12 +443,10 @@ class BCFComponentBase(BaseModel):
     authoring_tool_id: Optional[str] = None
 class BCFComponentCreate(BCFComponentBase):
     pass
-
 class BCFComponent(BCFComponentBase):
     guid: str
     viewpoint_guid: str
     class Config: from_attributes = True
-
 class BCFViewpointBase(BaseModel):
     index: Optional[int] = 0
     camera_view_point_x: float
@@ -410,16 +461,13 @@ class BCFViewpointBase(BaseModel):
     field_of_view: Optional[float] = None
     view_to_world_scale: Optional[float] = None
     snapshot_img: Optional[str] = None # Base64
-
 class BCFViewpointCreate(BCFViewpointBase):
     components: List[BCFComponentCreate] = []
-
 class BCFViewpoint(BCFViewpointBase):
     guid: str
     topic_guid: str
     components: List[BCFComponent] = []
     class Config: from_attributes = True
-
 class BCFCommentBase(BaseModel):
     comment: str
 

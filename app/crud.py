@@ -16,9 +16,7 @@ try:
     import ifcopenshell
 except ImportError:
     ifcopenshell = None
-
 UPLOAD_DIRECTORY = os.path.join(os.getcwd(), "uploads")
-
 def get_user(db: Session, user_id: int):
     return db.query(models.User).filter(models.User.id == user_id).first()
 def get_user_by_email(db: Session, email: str):
@@ -29,8 +27,7 @@ def create_user(db: Session, user: schemas.UserCreate):
         email=user.email, 
         hashed_password=hashed_password,
         company_id=user.company_id,
-        role=user.role
-    )
+        role=user.role )
     db.add(db_user); db.commit(); db.refresh(db_user); return db_user
 def get_company(db: Session, company_id: int):
     return db.query(models.Company).filter(models.Company.id == company_id).first()
@@ -39,6 +36,62 @@ def get_company_by_name(db: Session, name: str):
 def create_company(db: Session, company: schemas.CompanyCreate):
     db_company = models.Company(name=company.name)
     db.add(db_company); db.commit(); db.refresh(db_company); return db_company
+
+def create_concept(db: Session, concept: schemas.ConceptCreate):
+    db_concept = models.Concept(**concept.model_dump())
+    db.add(db_concept)
+    db.commit()
+    db.refresh(db_concept)
+    return db_concept
+
+def get_concepts(db: Session, company_id: int, skip: int = 0, limit: int = 100):
+    return db.query(models.Concept).filter(models.Concept.company_id == company_id).offset(skip).limit(limit).all()
+
+def get_concept(db: Session, concept_id: int):
+    return db.query(models.Concept).filter(models.Concept.id == concept_id).first()
+
+def update_concept(db: Session, concept_id: int, concept_update: schemas.ConceptUpdate):
+    db_concept = get_concept(db, concept_id)
+    if not db_concept: return None
+    update_data = concept_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items(): setattr(db_concept, key, value)
+    db.add(db_concept); db.commit(); db.refresh(db_concept); return db_concept
+
+def import_concepts_from_contracts(db: Session, company_id: int):
+    projects = db.query(models.Project).filter(models.Project.company_id == company_id).all()
+    project_ids = [p.id for p in projects]
+    
+    if not project_ids:
+        return 0        
+    items = db.query(models.ContractItem).join(models.Contract).filter(
+        models.Contract.project_id.in_(project_ids),
+        models.ContractItem.is_group == False 
+    ).all()    
+    imported_count = 0    
+    for item in items:
+        code = item.clave or f"GEN-{uuid.uuid4().hex[:8]}"        
+        existing = db.query(models.Concept).filter(
+            models.Concept.company_id == company_id,
+            models.Concept.code == code
+        ).first()        
+        if not existing:
+            new_concept = models.Concept(
+                code=code,
+                description=item.concepto,
+                unit=item.unidad or "un",
+                unit_price=item.precio_unitario,
+                company_id=company_id
+            )
+            db.add(new_concept)
+            imported_count += 1
+            
+    db.commit()
+    return imported_count
+
+def delete_concept(db: Session, concept_id: int):
+    db_concept = get_concept(db, concept_id)
+    if not db_concept: return None
+    db.delete(db_concept); db.commit(); return True
 def authenticate_user(db: Session, email: str, password: str):
     user = get_user_by_email(db, email=email)
     if not user:
@@ -112,6 +165,88 @@ def delete_task(db: Session, task_id: int, user: models.User):
         db.commit()
         return {"ok": True}
     raise HTTPException(status_code=403, detail="No tiene permisos para eliminar esta tarea")
+
+def recalculate_task_cost(db: Session, task_id: int):
+    task = get_task(db, task_id)
+    if not task: return
+    
+    total_cost = 0.0
+    for tc in task.concepts:
+        total_cost += tc.amount
+    
+    task.estimated_cost = total_cost
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+def assign_concept_to_task(db: Session, task_id: int, concept_id: int, quantity: float):
+    task = get_task(db, task_id)
+    concept = get_concept(db, concept_id)
+    if not task or not concept: return None    
+    existing = db.query(models.TaskConcept).filter(models.TaskConcept.task_id == task_id, models.TaskConcept.concept_id == concept_id).first()
+    if existing:
+        existing.quantity = quantity
+        existing.amount = quantity * concept.unit_price
+        db.add(existing)
+    else:
+        new_tc = models.TaskConcept(
+            task_id=task_id,
+            concept_id=concept_id,
+            quantity=quantity,
+            amount=quantity * concept.unit_price
+        )
+        db.add(new_tc)
+    
+    db.commit()
+    recalculate_task_cost(db, task_id)
+    return task
+
+def remove_concept_from_task(db: Session, task_id: int, concept_id: int):
+    tc = db.query(models.TaskConcept).filter(models.TaskConcept.task_id == task_id, models.TaskConcept.concept_id == concept_id).first()
+    if tc:
+        db.delete(tc)
+        db.commit()
+        recalculate_task_cost(db, task_id)
+        return True
+    return False
+
+
+def add_task_dependency(db: Session, predecessor_id: int, successor_id: int, type: str = "FS", lag: int = 0):
+    if predecessor_id == successor_id:
+        return False
+    
+    stmt = models.task_dependencies.select().where(
+        (models.task_dependencies.c.predecessor_id == predecessor_id) & 
+        (models.task_dependencies.c.successor_id == successor_id)
+    )
+    existing = db.execute(stmt).first()
+    if existing:
+        return True
+        
+    ins = models.task_dependencies.insert().values(
+        predecessor_id=predecessor_id,
+        successor_id=successor_id,
+        type=type,
+        lag=lag
+    )
+    db.execute(ins)
+    db.commit()
+    return True
+
+def remove_task_dependency(db: Session, predecessor_id: int, successor_id: int):
+    stmt = models.task_dependencies.delete().where(
+        (models.task_dependencies.c.predecessor_id == predecessor_id) & 
+        (models.task_dependencies.c.successor_id == successor_id)
+    )
+    db.execute(stmt)
+    db.commit()
+    return True
+
+def get_root_tasks(db: Session, project_id: int):
+    return db.query(models.Task).filter(
+        models.Task.project_id == project_id, models.Task.parent_id == None
+    ).all()
+
 def get_project_tasks(db: Session, project_id: int):
     return db.query(models.Task).filter(models.Task.project_id == project_id).all()
 def get_project_tasks_as_tree(db: Session, project_id: int) -> List[schemas.Task]:
@@ -273,10 +408,7 @@ def get_contract_by_number(db: Session, project_id: int, numero_contrato: str):
     return db.query(models.Contract).filter(models.Contract.project_id == project_id, models.Contract.numero_contrato == numero_contrato).first()
 
 def get_contract_for_permission_check(db: Session, contract_id: int):
-    """
-    Obtiene un contrato simple para validaciones de permisos.
-    Es más rápido que get_contract_details porque no carga todo el árbol.
-    """
+
     return db.query(models.Contract).options(joinedload(models.Contract.project)).filter(models.Contract.id == contract_id).first()
 
 def get_contract_details(db: Session, contract_id: int):
@@ -383,7 +515,20 @@ def import_contracts_from_excel(db: Session, project_id: int, file_contents: byt
                 updated_count += 1
             else:
                 # Si no existe, se crea
-                contract_data = schemas.ContractCreate(numero_contrato=numero_contrato, contractor_id=contractor.id, trabajos=str(row.get('Trabajo', '')), aplica_iva=str(row.get('Aplica IVA', 'SI')).strip().upper() == 'SI', monto_contratado_manual=float(row.get('Monto Contratado (Manual)') or 0.0), anticipo=float(row.get('Anticipo') or 0.0), status=str(row.get('Status') or 'Borrador'), external_url=str(row.get('URL Externa', '')), work_item_id=work_item_id)
+                contract_data = schemas.ContractCreate(
+                    numero_contrato=numero_contrato, 
+                    contractor_id=contractor.id, 
+                    trabajos=str(row.get('Trabajo', '')), 
+                    aplica_iva=str(row.get('Aplica IVA', 'SI')).strip().upper() == 'SI', 
+                    monto_contratado_manual=float(row.get('Monto Contratado (Manual)') or 0.0), 
+                    anticipo=float(row.get('Anticipo') or 0.0), 
+                    status=str(row.get('Status') or 'Borrador'), 
+                    external_url=str(row.get('URL Externa', '')), 
+                    work_item_id=work_item_id,
+                    start_date=row.get('Fecha Inicio') if not pd.isna(row.get('Fecha Inicio')) else None,
+                    end_date=row.get('Fecha Fin') if not pd.isna(row.get('Fecha Fin')) else None,
+                    avance_fisico=float(row.get('Avance Fisico') or 0.0)
+                )
                 create_contract(db=db, contract=contract_data, project_id=project_id)
                 created_count += 1
         except Exception as e:
@@ -505,11 +650,9 @@ def import_contract_items_from_excel(db: Session, contract_id: int, file_content
 def create_estimate(db: Session, estimate: schemas.EstimateCreate, project_id: int):
     estimate_data = estimate.model_dump(exclude={'porcentaje_fondo_garantia'})
     db_estimate = models.Estimate(**estimate_data, project_id=project_id)
-
-    # Lógica de cálculo para el fondo de garantía al crear
     if estimate.porcentaje_fondo_garantia is not None:
         monto_base = estimate.monto_estimado_manual or 0.0
-        porcentaje = estimate.porcentaje_fondo_garantia / 100.0 # Convertir 5% a 0.05
+        porcentaje = estimate.porcentaje_fondo_garantia / 100.0
         db_estimate.fondo_garantia = monto_base * porcentaje
 
     db.add(db_estimate)
@@ -519,9 +662,9 @@ def create_estimate(db: Session, estimate: schemas.EstimateCreate, project_id: i
 
 def get_project_estimates(db: Session, project_id: int):
     return db.query(models.Estimate).filter(models.Estimate.project_id == project_id).options(
-        joinedload(models.Estimate.contract), # Carga el contrato de la estimación
-        joinedload(models.Estimate.estimate_items).options( # Carga los items de la estimación...
-            joinedload(models.EstimateItem.contract_item) # ...y para cada item, carga su concepto de contrato.
+        joinedload(models.Estimate.contract), 
+        joinedload(models.Estimate.estimate_items).options( 
+            joinedload(models.EstimateItem.contract_item) 
         )
     ).all()
 def get_estimate(db: Session, estimate_id: int):
@@ -538,23 +681,18 @@ def update_estimate(db: Session, estimate_id: int, estimate_update: schemas.Esti
     db_estimate = db.query(models.Estimate).filter(models.Estimate.id == estimate_id).first()
     if not db_estimate: return None
 
-    # Extraer el porcentaje antes de actualizar el resto
     porcentaje_fg = estimate_update.porcentaje_fondo_garantia
     update_data = estimate_update.model_dump(exclude_none=True, exclude={'porcentaje_fondo_garantia'})
 
     for key, value in update_data.items(): setattr(db_estimate, key, value)
 
-    # === LÓGICA DE RECÁLCULO DEL FONDO DE GARANTÍA ===
     if porcentaje_fg is not None:
-        # Calculamos el total_estimado basado en los items o el monto manual
         total_items = db.query(func.sum(models.EstimateItem.cantidad_estimada * models.ContractItem.precio_unitario))\
             .join(models.ContractItem, models.EstimateItem.contract_item_id == models.ContractItem.id)\
             .filter(models.EstimateItem.estimate_id == estimate_id).scalar() or 0.0
 
         monto_base = total_items if total_items > 0 else (db_estimate.monto_estimado_manual or 0.0)
-        porcentaje = porcentaje_fg / 100.0 # Convertir 5% a 0.05
-        
-        # Actualizamos el campo del monto en el objeto de la base de datos.
+        porcentaje = porcentaje_fg / 100.0        
         db_estimate.fondo_garantia = monto_base * porcentaje
         
     db.add(db_estimate)
@@ -742,6 +880,17 @@ def create_new_document_version(db: Session, file: UploadFile, document_id: int)
         file_type=file.content_type, file_size=file_size
     )
     db.add(db_version); db.commit(); db.refresh(db_version)
+    
+    try:
+        from .utils import convert_ifc_to_frag
+        if file.filename.lower().endswith(".ifc"):
+            print(f"Iniciando conversión a Fragments para: {file_path}")
+            convert_ifc_to_frag(file_path, UPLOAD_DIRECTORY)
+    except ImportError:
+        print("Warning: app.utils.convert_ifc_to_frag not found.")
+    except Exception as e:
+        print(f"Error triggering conversion: {e}")
+
     if ifc_file:
         print(f"Archivo IFC detectado. Extrayendo elementos para la versión {db_version.id}...")
         elements_to_add = []
@@ -809,7 +958,7 @@ def create_bcf_topic(db: Session, topic_data: schemas.BCFTopicCreate, project_id
             topic_guid=db_topic.guid
         )
         db.add(db_viewpoint)
-        db.flush() # Flush para obtener el GUID del viewpoint
+        db.flush() 
         for component_data in viewpoint_data.components:
             db_component = models.BCFComponent(**component_data.model_dump(), viewpoint_guid=db_viewpoint.guid)
             db.add(db_component)
@@ -827,3 +976,197 @@ def update_bcf_topic(db: Session, topic_guid: str, topic_update: schemas.BCFTopi
     for key, value in update_data.items(): setattr(db_topic, key, value)
     db_topic.modified_author = author_email
     db.add(db_topic); db.commit(); db.refresh(db_topic); return db_topic
+def export_project_tasks_to_excel(db: Session, project_id: int):
+    tasks = get_project_tasks(db, project_id)
+    if not tasks:
+        return io.BytesIO()
+
+    data_list = []
+    for task in tasks:
+        total_cost = sum(tc.amount for tc in task.concepts)
+        
+        data_list.append({
+            "ID": task.id,
+            "Nombre": task.name,
+            "Descripcion": task.description,
+            "Fecha Inicio": task.start_date,
+            "Fecha Fin": task.end_date,
+            "Peso": task.weight,
+            "Costo Estimado": total_cost,
+            "Estado": task.status,
+            "Progreso": task.progress,
+            "ID Padre": task.parent_id
+        })
+
+    df = pd.DataFrame(data_list)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Tareas", index=False)
+    output.seek(0)
+    return output
+
+
+def import_tasks_from_excel(db: Session, project_id: int, file_contents: bytes):
+    try:
+        df = pd.read_excel(io.BytesIO(file_contents)).fillna("")
+        # Ensure ID column is treated as string
+        if "ID" in df.columns:
+            df["ID"] = df["ID"].astype(str)
+    except Exception as e:
+        return {"error": f"Error al leer el archivo Excel: {str(e)}"}
+
+    created_count = 0
+    errors = []    
+    wbs_map = {}
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    creator_id = None
+    if project and project.company:
+        user = db.query(models.User).filter(models.User.company_id == project.company_id).first()
+        if user: creator_id = user.id
+
+    if "ID" in df.columns:
+        try:
+            df = df.sort_values(by="ID")
+        except:
+            pass
+
+    for index, row in df.iterrows():
+        try:
+            name = str(row.get("Nombre", "")).strip()
+            if not name: continue
+
+            wbs_id = str(row.get("ID", "")).strip()            
+            parent_id = None
+            parent_wbs_from_id_padre = str(row.get("ID Padre", "")).strip()
+            if parent_wbs_from_id_padre and parent_wbs_from_id_padre in wbs_map:
+                parent_id = wbs_map[parent_wbs_from_id_padre]
+            elif parent_id is None and wbs_id and "." in wbs_id:
+                parent_wbs_from_id = wbs_id.rsplit(".", 1)[0] 
+                if parent_wbs_from_id in wbs_map:
+                    parent_id = wbs_map[parent_wbs_from_id]
+
+            start_date = row.get("Fecha Inicio")
+            end_date = row.get("Fecha Fin")
+            weight = row.get("Peso", 1.0)
+            estimated_cost = row.get("Costo Estimado", 0.0)
+            
+            if pd.isna(start_date) or start_date == "": start_date = date.today()
+            else: start_date = pd.to_datetime(start_date).date()
+            
+            if pd.isna(end_date) or end_date == "": end_date = date.today()
+            else: end_date = pd.to_datetime(end_date).date()
+
+            new_task = models.Task(
+                name=name,
+                description=str(row.get("Descripcion", "")),
+                start_date=start_date,
+                end_date=end_date,
+                weight=float(weight) if weight != "" else 1.0,
+                estimated_cost=float(estimated_cost) if estimated_cost != "" else 0.0,
+                project_id=project_id,
+                creator_id=creator_id,
+                status="Pendiente",
+                progress=0,
+                parent_id=parent_id # Link to parent
+            )
+            db.add(new_task)
+            db.flush() # Flush to get the ID
+            
+            if wbs_id:
+                wbs_map[wbs_id] = new_task.id
+                
+            created_count += 1
+        except Exception as e:
+            errors.append(f"Fila {index + 2}: {str(e)}")
+            continue
+
+    db.commit()
+    return {"message": f"Se importaron {created_count} tareas.", "errors": errors}
+
+# --- Contract Item CRUD (Agregado/Redefinido para asegurar existencia) ---
+
+def create_contract_item(db: Session, item: schemas.ContractItemCreate, contract_id: int):
+    item_data = item.model_dump()
+    db_item = models.ContractItem(**item_data, contract_id=contract_id)
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+def get_contract_item(db: Session, item_id: int):
+    return db.query(models.ContractItem).filter(models.ContractItem.id == item_id).first()
+
+def update_contract_item(db: Session, item_id: int, item_update: schemas.ContractItemUpdate):
+    db_item = get_contract_item(db, item_id=item_id)
+    if not db_item:
+        return None
+    
+    update_data = item_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_item, key, value)
+    
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+def delete_contract_item(db: Session, item_id: int):
+    db_item = get_contract_item(db, item_id=item_id)
+    if not db_item:
+        return None
+    db.delete(db_item)
+    db.commit()
+    return db_item
+
+def assign_cost_to_task(db: Session, project_id: int, task_id: int, amount: float, description: str):
+    # 1. Buscar contrato "Borrador"
+    draft_contract = db.query(models.Contract).filter(
+        models.Contract.project_id == project_id,
+        models.Contract.status == "Borrador"
+    ).first()
+
+    if not draft_contract:
+        contractor = db.query(models.Contractor).filter(models.Contractor.project_id == project_id).first()
+        if not contractor:
+            contractor = models.Contractor(razon_social="Contratista General (Auto)", project_id=project_id)
+            db.add(contractor); db.commit(); db.refresh(contractor)        
+        draft_contract = models.Contract(
+            numero_contrato=f"DRAFT-{project_id}-{int(date.today().strftime('%Y%m%d'))}",
+            contractor_id=contractor.id,
+            project_id=project_id,
+            trabajos="Costos Directos de Tareas",
+            status="Borrador"
+        )
+        db.add(draft_contract); db.commit(); db.refresh(draft_contract)
+    
+    new_item = models.ContractItem(
+        contract_id=draft_contract.id,
+        concepto=description,
+        precio_unitario=amount,
+        cantidad_contratada=1.0,
+        task_id=task_id,
+        tipo_concepto="Ordinario"
+    )
+    db.add(new_item)
+    
+    # 4. Actualizar costo estimado de la tarea (cache)
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if task:
+        task.estimated_cost = (task.estimated_cost or 0.0) + amount
+        db.add(task)
+        
+    db.commit()
+    db.refresh(new_item)
+    return new_item
+
+def get_task_costs(db: Session, task_id: int):
+    """
+    Obtiene el historial de costos asignados a una tarea.
+    Retorna objetos ContractItem que luego el endpoint transformará o
+    usará directamente si el schema coincide.
+    """
+    return db.query(models.ContractItem).options(
+        joinedload(models.ContractItem.contract)
+    ).filter(models.ContractItem.task_id == task_id).all()
+
+

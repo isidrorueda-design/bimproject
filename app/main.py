@@ -192,7 +192,206 @@ def delete_task_endpoint(
     crud.delete_task(db=db, task_id=task_id, user=current_user)
     return Response(status_code=204)
 
-@app.post("/projects/{project_id}/import-excel/", status_code=201)
+@app.put("/tasks/{task_id}", response_model=schemas.Task)
+def update_task_endpoint(
+    task_id: int,
+    task_update: schemas.TaskUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    if not task or task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+        
+    updated_task = crud.update_task(db=db, task_id=task_id, task_update=task_update)
+    return updated_task
+
+# --- Concept Endpoints ---
+@app.post("/concepts/", response_model=schemas.Concept)
+def create_concept_endpoint(
+    concept: schemas.ConceptCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    if concept.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="No puede crear conceptos para otra compañía")
+    return crud.create_concept(db=db, concept=concept)
+
+@app.get("/concepts/", response_model=List[schemas.Concept])
+def read_concepts(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    return crud.get_concepts(db, company_id=current_user.company_id, skip=skip, limit=limit)
+
+@app.put("/concepts/{concept_id}", response_model=schemas.Concept)
+def update_concept_endpoint(
+    concept_id: int,
+    concept_update: schemas.ConceptUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    concept = crud.get_concept(db, concept_id)
+    if not concept or concept.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Concepto no encontrado")
+    return crud.update_concept(db=db, concept_id=concept_id, concept_update=concept_update)
+
+@app.delete("/concepts/{concept_id}", status_code=204)
+def delete_concept_endpoint(
+    concept_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    concept = crud.get_concept(db, concept_id)
+    if not concept or concept.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Concepto no encontrado")
+    crud.delete_concept(db=db, concept_id=concept_id)
+    return Response(status_code=204)
+
+@app.post("/concepts/import-from-contracts", status_code=200)
+def import_concepts_from_contracts_endpoint(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_admin)
+):
+    count = crud.import_concepts_from_contracts(db, current_user.company_id)
+    return {"message": f"Se importaron {count} conceptos desde los contratos existentes"}
+
+@app.post("/tasks/{task_id}/concepts", response_model=schemas.Task)
+def assign_concept_to_task_endpoint(
+    task_id: int,
+    concept_assignment: schemas.TaskConceptCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    # Verify task access
+    task = crud.get_task(db, task_id)
+    if not task or task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+        
+    result = crud.assign_concept_to_task(db, task_id, concept_assignment.concept_id, concept_assignment.quantity)
+    if not result:
+        raise HTTPException(status_code=400, detail="Error al asignar concepto")
+    return result
+
+@app.delete("/tasks/{task_id}/concepts/{concept_id}", status_code=204)
+def remove_concept_from_task_endpoint(
+    task_id: int,
+    concept_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    if not task or task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+        
+    result = crud.remove_concept_from_task(db, task_id, concept_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Asignación no encontrada")
+    return Response(status_code=204)
+
+@app.post("/tasks/{task_id}/dependencies/{predecessor_id}", status_code=201)
+def add_task_dependency_endpoint(
+    task_id: int,
+    predecessor_id: int,
+    type: str = "FS",
+    lag: int = 0,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    pred = crud.get_task(db, predecessor_id)
+    
+    if not task or not pred:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    if task.project.company_id != current_user.company_id or pred.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="No tiene permisos")
+        
+    result = crud.add_task_dependency(db, predecessor_id, task_id, type, lag)
+    if not result:
+        raise HTTPException(status_code=400, detail="Error al crear dependencia (posible ciclo)")
+    return {"ok": True}
+
+@app.delete("/tasks/{task_id}/dependencies/{predecessor_id}", status_code=204)
+def remove_task_dependency_endpoint(
+    task_id: int,
+    predecessor_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    if not task or task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+        
+    crud.remove_task_dependency(db, predecessor_id, task_id)
+    return Response(status_code=204)
+
+@app.post("/tasks/{task_id}/cost", status_code=201)
+def assign_cost_to_task_endpoint(
+    task_id: int,
+    cost_data: schemas.TaskCostCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    if task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="No tiene permisos")
+        
+    return crud.assign_cost_to_task(db, task.project_id, task_id, cost_data.amount, cost_data.description)
+
+@app.get("/tasks/{task_id}/cost", response_model=List[schemas.TaskCost])
+def get_task_costs_endpoint(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    if task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="No tiene permisos")
+        
+    items = crud.get_task_costs(db, task_id)
+    # Transform ContractItem to TaskCost schema
+    result = []
+    for item in items:
+        # Usamos la fecha del contrato como fecha del costo, si existe
+        cost_date = item.contract.start_date if item.contract else None
+        
+        result.append({
+            "id": item.id,
+            "amount": item.precio_unitario, # Asumiendo cantidad 1
+            "description": item.concepto,
+            "date": cost_date,
+            "contract_item": item # Pydantic se encargará de convertir esto a ContractItemBase si coinciden campos
+        })
+    return result
+
+@app.get("/projects/{project_id}/tasks/root", response_model=List[schemas.Task])
+def get_project_root_tasks(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    root_tasks = crud.get_root_tasks(db, project_id)
+    return root_tasks
+
+@app.get("/tasks/{task_id}/children", response_model=List[schemas.Task])
+def get_task_children_endpoint(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    task = crud.get_task(db, task_id)
+    if not task or task.project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada o no pertenece a su compañía")
+    return task.subtasks
+
+@app.post("/projects/{project_id}/tasks/import", status_code=201)
 async def import_project_tasks_excel(
     project_id: int, 
     file: UploadFile = File(...), 
@@ -208,6 +407,20 @@ async def import_project_tasks_excel(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
+
+@app.get("/projects/{project_id}/tasks/export")
+def export_project_tasks(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    file_stream = crud.export_project_tasks_to_excel(db, project_id)
+    
+    headers = {
+        'Content-Disposition': f'attachment; filename="tareas_proyecto_{project_id}.xlsx"'
+    }
+    return StreamingResponse(file_stream, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.post("/projects/{project_id}/contractors", response_model=schemas.Contractor, status_code=201)
 def create_contractor(
@@ -414,8 +627,7 @@ async def import_contracts_endpoint(
     project_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_company_user)
-):
+    current_user: models.User = Depends(dependencies.get_current_company_user)):
     get_project_for_user(db, project_id, current_user.company_id)
     if not file.filename.endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Formato de archivo inválido. Se requiere .xlsx")
@@ -433,9 +645,7 @@ async def import_contracts_endpoint(
 def export_contracts_endpoint(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_company_user)
-):
-    # Asegurarse que el proyecto pertenece al usuario
+    current_user: models.User = Depends(dependencies.get_current_company_user)):
     get_project_for_user(db, project_id, current_user.company_id)
     try:
         excel_bytes = crud.export_contracts_to_excel(db=db, project_id=project_id)
@@ -751,19 +961,38 @@ async def upload_document_version_endpoint(
 @app.get("/documents/file/{version_id}")
 def get_document_file(
     version_id: int, 
+    format: str = "ifc",  # <--- Agregamos este parámetro opcional
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_active_user)
 ):
     db_version = crud.get_document_version(db, version_id=version_id)
     if not db_version:
-        raise HTTPException(status_code=404, detail="Versión del documento no encontrada")    
+        raise HTTPException(status_code=404, detail="Versión del documento no encontrada")
+    
+    # Validación de permisos (sin cambios)
     if current_user.role != "super_admin":
         db_doc = crud.get_document_concept_with_project(db, db_version.document_id)
-        get_project_for_user(db, db_doc.folder.project_id, current_user.company_id)    
+        get_project_for_user(db, db_doc.folder.project_id, current_user.company_id)
+    
     file_path = db_version.file_path
+    
+    # --- LÓGICA NUEVA PARA SERVIR FRAGMENTS ---
+    if format == "frag":
+        # Cambiamos la extensión del path original (.ifc) a .frag
+        # Asumimos que el convertidor ya creó este archivo en la misma carpeta
+        file_path = file_path.rsplit('.', 1)[0] + ".frag"
+        media_type = "application/octet-stream"
+        filename = db_version.filename.rsplit('.', 1)[0] + ".frag"
+    else:
+        # Comportamiento normal (IFC)
+        media_type = db_version.file_type
+        filename = db_version.filename
+    # ------------------------------------------
+
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Archivo no encontrado en el servidor")
-    return FileResponse(path=file_path, media_type=db_version.file_type, filename=db_version.filename)
+        raise HTTPException(status_code=404, detail=f"Archivo no encontrado en el servidor: {file_path}")
+        
+    return FileResponse(path=file_path, media_type=media_type, filename=filename)
 @app.post("/link/document/{document_id}/contract/{contract_id}")
 def link_document_contract_endpoint(
     document_id: int,
