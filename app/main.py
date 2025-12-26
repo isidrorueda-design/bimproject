@@ -585,6 +585,24 @@ def read_project_contracts_endpoint(
 ):
     get_project_for_user(db, project_id, current_user.company_id)
     return crud.get_project_contracts(db=db, project_id=project_id)
+
+@app.get("/projects/{project_id}/estimates/", response_model=List[schemas.Estimate])
+def read_project_estimates(
+    project_id: int, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.get_project_estimates(db=db, project_id=project_id)
+
+@app.get("/projects/{project_id}/tasks/", response_model=List[schemas.Task])
+def read_project_tasks_list(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    get_project_for_user(db, project_id, current_user.company_id)
+    return crud.get_project_tasks(db=db, project_id=project_id)
 @app.get("/contracts/{contract_id}", response_model=schemas.Contract)
 def read_contract_by_id_endpoint(
     contract_id: int, 
@@ -669,18 +687,20 @@ def create_contract_item_endpoint(
     if not db_contract or db_contract.project.company_id != current_user.company_id:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
     return crud.create_contract_item(db=db, item=item, contract_id=contract_id)
-@app.put("/contract_items/{item_id}", response_model=schemas.ContractItem)
-def update_contract_item_endpoint(
-    item_id: int,
-    item_update: schemas.ContractItemUpdate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(dependencies.get_current_company_user)
-):
     db_item = crud.get_contract_item(db, item_id=item_id)
     if not db_item:
         raise HTTPException(status_code=404, detail="Item de contrato no encontrado")
     get_project_for_user(db, db_item.contract.project_id, current_user.company_id)
     return crud.update_contract_item(db, item_id=item_id, item_update=item_update)
+
+@app.patch("/contract_items/{item_id}", response_model=schemas.ContractItem)
+def patch_contract_item_endpoint(
+    item_id: int,
+    item_update: schemas.ContractItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    return update_contract_item_endpoint(item_id=item_id, item_update=item_update, db=db, current_user=current_user)
 @app.delete("/contract_items/{item_id}", status_code=204)
 def delete_contract_item_endpoint(
     item_id: int,

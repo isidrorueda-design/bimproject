@@ -661,12 +661,23 @@ def create_estimate(db: Session, estimate: schemas.EstimateCreate, project_id: i
     return get_estimate(db, db_estimate.id)
 
 def get_project_estimates(db: Session, project_id: int):
-    return db.query(models.Estimate).filter(models.Estimate.project_id == project_id).options(
-        joinedload(models.Estimate.contract), 
-        joinedload(models.Estimate.estimate_items).options( 
-            joinedload(models.EstimateItem.contract_item) 
-        )
-    ).all()
+    """
+    Obtiene todas las estimaciones de un proyecto.
+    Incluye relaciones con Contrato y Contratista para el dashboard.
+    """
+    return db.query(models.Estimate)\
+             .join(models.Contract)\
+             .filter(models.Contract.project_id == project_id)\
+             .options(
+                 joinedload(models.Estimate.contract).joinedload(models.Contract.contractor),
+                 joinedload(models.Estimate.estimate_items).options( 
+                    joinedload(models.EstimateItem.contract_item) 
+                 )
+             )\
+             .all()
+
+def get_project_tasks(db: Session, project_id: int):
+    return db.query(models.Task).filter(models.Task.project_id == project_id).all()
 def get_estimate(db: Session, estimate_id: int):
     return db.query(models.Estimate).filter(models.Estimate.id == estimate_id).options(
         joinedload(models.Estimate.contract).options(
