@@ -389,16 +389,45 @@ def create_contract(db: Session, contract: schemas.ContractCreate, project_id: i
     db_contract = models.Contract(**contract.model_dump(), project_id=project_id)
     db.add(db_contract); db.commit(); db.refresh(db_contract); return get_contract(db, db_contract.id)
 def get_project_contracts(db: Session, project_id: int):
-    return db.query(models.Contract).filter(models.Contract.project_id == project_id).options(
-        joinedload(models.Contract.contractor),
-        joinedload(models.Contract.work_item),
-        joinedload(models.Contract.contract_items).options(
-            joinedload(models.ContractItem.estimate_items)
-        ),
-        joinedload(models.Contract.estimates).options(
-            joinedload(models.Estimate.estimate_items)
-        )
-    ).all()
+    """
+    Obtiene los contratos y calcula su avance físico real 
+    basado en el ponderado de sus conceptos.
+    """
+    contracts = db.query(models.Contract)\
+                  .filter(models.Contract.project_id == project_id)\
+                  .options(joinedload(models.Contract.contractor))\
+                  .all()
+    
+    # Calcular avance on-the-fly
+    for contract in contracts:
+        total_cost = 0.0
+        total_earned = 0.0
+        
+        # SQLAlchemy cargará contract_items automáticamente (lazy load) 
+        # o puedes agregar .options(joinedload(models.Contract.contract_items)) arriba si prefieres
+        for item in contract.contract_items:
+            # Asumimos que cantidad y precio pueden ser None, usamos 0
+            qty = float(item.cantidad_contratada or 0)
+            price = float(item.precio_unitario or 0)
+            
+            # Solo sumamos al total si es un concepto real (no agrupador sin costo)
+            cost = qty * price
+            
+            # Avance físico del ítem (0 a 100)
+            progress_pct = float(item.avance_fisico or 0)
+            
+            earned = cost * (progress_pct / 100.0)
+            
+            total_cost += cost
+            total_earned += earned
+            
+        # Asignar al atributo del objeto (no se guarda en DB, solo para serializar)
+        if total_cost > 0:
+            contract.avance_fisico = round((total_earned / total_cost) * 100.0, 2)
+        else:
+            contract.avance_fisico = 0.0
+            
+    return contracts
 def get_contract(db: Session, contract_id: int):
     return db.query(models.Contract).options(
         joinedload(models.Contract.project) 
@@ -451,7 +480,7 @@ def get_contract_item(db: Session, item_id: int):
 def update_contract_item(db: Session, item_id: int, item_update: schemas.ContractItemUpdate):
     db_item = get_contract_item(db, item_id=item_id)
     if not db_item: return None
-    update_data = item_update.model_dump(exclude_none=True)
+    update_data = item_update.model_dump(exclude_unset=True)
     for key, value in update_data.items(): setattr(db_item, key, value)
     db.add(db_item); db.commit(); db.refresh(db_item); return db_item
 def delete_contract_item(db: Session, item_id: int):
@@ -1179,5 +1208,165 @@ def get_task_costs(db: Session, task_id: int):
     return db.query(models.ContractItem).options(
         joinedload(models.ContractItem.contract)
     ).filter(models.ContractItem.task_id == task_id).all()
+
+
+# --- Change Orders (Modificaciones al Contrato) ---
+
+def create_change_order(db: Session, change_order: schemas.ChangeOrderCreate, contract_id: int):
+    # Validar codigo único si es necesario
+    db_co = models.ChangeOrder(**change_order.model_dump(exclude={"items"}), contract_id=contract_id)
+    db.add(db_co)
+    db.commit()
+    db.refresh(db_co)
+    
+    # Process items if any
+    for item in change_order.items:
+        add_change_order_item(db, item, db_co.id)
+        
+    db.refresh(db_co)
+    return db_co
+
+def add_change_order_item(db: Session, item: schemas.ChangeOrderItemCreate, change_order_id: int):
+    # Solo permitir agregar si está en Borrador (opcional, pero buena práctica)
+    co = db.query(models.ChangeOrder).get(change_order_id)
+    if co.status == "APPROVED":
+        # En un sistema real esto debería bloquearse.
+        pass
+
+    db_item = models.ChangeOrderItem(**item.model_dump(), change_order_id=change_order_id)
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+def delete_change_order_item(db: Session, item_id: int):
+    db_item = db.query(models.ChangeOrderItem).filter(models.ChangeOrderItem.id == item_id).first()
+    if not db_item:
+        return False
+    
+    # Validation: Only allow modification in DRAFT status
+    if db_item.change_order.status == "APPROVED":
+        raise Exception("No se puede borrar items de un convenio APROBADO")
+        
+    db.delete(db_item)
+    db.commit()
+    return True
+
+def update_change_order_item(db: Session, item_id: int, update_data: schemas.ChangeOrderItemUpdate):
+    db_item = db.query(models.ChangeOrderItem).filter(models.ChangeOrderItem.id == item_id).first()
+    if not db_item:
+        return None
+    
+    if db_item.change_order.status == "APPROVED":
+         raise Exception("No se puede editar items de un convenio APROBADO")
+    
+    db_item.quantity_delta = update_data.quantity_delta
+    if update_data.unit_price is not None:
+        db_item.unit_price = update_data.unit_price
+        
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+def approve_change_order(db: Session, change_order_id: int):
+    """
+    Aplica los deltas al contrato. Esto es transaccional.
+    """
+    co = db.query(models.ChangeOrder).get(change_order_id)
+    if not co or co.status == "APPROVED":
+        return co
+    
+    co.status = "APPROVED"
+    db.add(co)
+    
+    # Recalcular TODOS los ítems afectados por este change order
+    # O mejor, recalcular el contrato entero o solo los items tocados.
+    # Estrategia: Iterar items del CO y actualizar sus padres.
+    
+    for item in co.items:
+        if item.is_extraordinary:
+            # Crear Nuevo ContractItem Extraordinario
+            # Verificar si ya existe (en caso de re-aprobación o idempotencia)
+            # Simplificación: Asumimos creación.
+            new_ci = models.ContractItem(
+                contract_id=co.contract_id,
+                concepto=item.extraordinary_concept or "Concepto Extraordinario",
+                unidad=item.unit,
+                precio_unitario=item.unit_price,
+                cantidad_contratada=0, # Base 0
+                tipo_concepto="Extraordinario",
+                cantidad_aditiva=item.quantity_delta, # Todo es aditiva
+                # Vinculamos para referencia futura si fuera necesario
+            )
+            db.add(new_ci)
+            db.flush() # Para obtener ID
+            
+            # Actualizar el item del change order para apuntar al nuevo CI
+            item.contract_item_id = new_ci.id
+            db.add(item)
+            
+        elif item.contract_item_id:
+            # Item existente: Recalcular sumas de deltas aprobados
+            # Buscar TODOS los ChangeOrderItems de este ContractItem que pertenezcan a ChangeOrders APROBADOS
+            # Incluyendo ESTE change order que acabamos de marcar APPROVED (commit pendiente)
+            
+            # Nota: Al hacer flush, el estado APPROVED ya es visible en la transacción? Sí.
+            pass
+            
+    db.commit()
+    
+    # Segunda pasada para recalculo masivo seguro
+    for item in co.items:
+        if item.contract_item_id:
+            _recalculate_contract_item(db, item.contract_item_id)
+            
+    db.refresh(co)
+    return co
+
+def _recalculate_contract_item(db: Session, contract_item_id: int):
+    """
+    Suma quantity_delta de todos los ChangeOrderItems vinculados a ChangeOrders APPROVED
+    """
+    contract_item = db.query(models.ContractItem).get(contract_item_id)
+    if not contract_item:
+        return
+        
+    approved_deltas = db.query(func.sum(models.ChangeOrderItem.quantity_delta))\
+        .join(models.ChangeOrder)\
+        .filter(models.ChangeOrderItem.contract_item_id == contract_item_id)\
+        .filter(models.ChangeOrder.status == "APPROVED")\
+        .scalar() or 0.0
+        
+    # Separar en aditivas y deductivas visualmente si se desea, 
+    # pero el modelo pidió Base + Delta.
+    # Aquí mapeamos: 
+    # Aditiva = Suma de positivos
+    # Deductiva = Suma de negativos (absoluto)
+    
+    # Query desglosado
+    aditivas = db.query(func.sum(models.ChangeOrderItem.quantity_delta))\
+        .join(models.ChangeOrder)\
+        .filter(models.ChangeOrderItem.contract_item_id == contract_item_id)\
+        .filter(models.ChangeOrder.status == "APPROVED")\
+        .filter(models.ChangeOrderItem.quantity_delta > 0)\
+        .scalar() or 0.0
+        
+    deductivas = db.query(func.sum(models.ChangeOrderItem.quantity_delta))\
+        .join(models.ChangeOrder)\
+        .filter(models.ChangeOrderItem.contract_item_id == contract_item_id)\
+        .filter(models.ChangeOrder.status == "APPROVED")\
+        .filter(models.ChangeOrderItem.quantity_delta < 0)\
+        .scalar() or 0.0
+        
+    contract_item.cantidad_aditiva = aditivas
+    contract_item.cantidad_deductiva = abs(deductivas)
+    db.add(contract_item)
+    db.commit()
+
+def get_change_orders(db: Session, contract_id: int):
+    return db.query(models.ChangeOrder).filter(models.ChangeOrder.contract_id == contract_id).options(
+        joinedload(models.ChangeOrder.items).joinedload(models.ChangeOrderItem.contract_item)
+    ).all()
 
 

@@ -10,6 +10,12 @@ document_contract_link = Table('document_contract_link', Base.metadata,
     Column('contract_id', Integer, ForeignKey('contracts.id'), primary_key=True)
 )
 
+task_dependencies = Table('task_dependencies', Base.metadata,
+    Column('predecessor_id', Integer, ForeignKey('tasks.id'), primary_key=True),
+    Column('successor_id', Integer, ForeignKey('tasks.id'), primary_key=True),
+    Column('type', String, default="FS"),
+    Column('lag', Integer, default=0))
+
 # --- TABLAS DE USUARIOS/EMPRESAS ---
 class Company(Base):
     __tablename__ = "companies"
@@ -26,8 +32,8 @@ class User(Base):
     role = Column(String, default="user")
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)    
     company = relationship("Company", back_populates="users")
-    responsible_tasks = relationship("Task", foreign_keys="[Task.responsible_user_id]", back_populates="responsible_user")
-    created_tasks = relationship("Task", foreign_keys="[Task.creator_id]", back_populates="creator")
+    responsible_tasks = relationship("Task", foreign_keys="Task.responsible_user_id", back_populates="responsible_user")
+    created_tasks = relationship("Task", foreign_keys="Task.creator_id", back_populates="creator")
 
 class Project(Base):
     __tablename__ = "projects"    
@@ -55,6 +61,27 @@ class Contractor(Base):
     project = relationship("Project", back_populates="contractors")
     contracts = relationship("Contract", back_populates="contractor") 
 
+class Concept(Base):
+    __tablename__ = "concepts"
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String, index=True, nullable=False)
+    description = Column(String, nullable=False)
+    unit = Column(String, nullable=False)
+    unit_price = Column(Float, default=0.0)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)    
+    company = relationship("Company")
+    task_concepts = relationship("TaskConcept", back_populates="concept")
+
+class TaskConcept(Base):
+    __tablename__ = "task_concepts"
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    concept_id = Column(Integer, ForeignKey("concepts.id"), nullable=False)
+    quantity = Column(Float, default=0.0)
+    amount = Column(Float, default=0.0)    
+    task = relationship("Task", back_populates="concepts")
+    concept = relationship("Concept", back_populates="task_concepts")
+
 class Task(Base):
     __tablename__ = "tasks"
     id = Column(Integer, primary_key=True, index=True)
@@ -71,27 +98,38 @@ class Task(Base):
     priority = Column(Integer, default=2)
     responsible_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)    
     creator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-
     responsible_user = relationship("User", foreign_keys=[responsible_user_id], back_populates="responsible_tasks")
     creator = relationship("User", foreign_keys=[creator_id], back_populates="created_tasks")
     subtasks = relationship("Task", back_populates="parent", cascade="all, delete-orphan")
     parent = relationship("Task", back_populates="subtasks", remote_side=[id])
-    project = relationship("Project", back_populates="tasks")
-
-
+    project = relationship("Project", back_populates="tasks")    
+    weight = Column(Float, default=1.0)
+    estimated_cost = Column(Float, default=0.0)    
+    concepts = relationship("TaskConcept", back_populates="task", cascade="all, delete-orphan")    
+    predecessors = relationship(
+        "Task",
+        secondary=task_dependencies,
+        primaryjoin=id==task_dependencies.c.successor_id,
+        secondaryjoin=id==task_dependencies.c.predecessor_id,
+        backref="successors"
+    )
+    contract_items = relationship("ContractItem", back_populates="task")
 class WorkItem(Base):
-
     __tablename__ = "work_items"
     id = Column(Integer, primary_key=True, index=True)
     item_code = Column(String, index=True) 
     description = Column(String)
     presupuesto_base = Column(Float, default=0.0)     
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)    
+    planned_start_date = Column(Date, nullable=True)
+    planned_end_date = Column(Date, nullable=True)
+    real_start_date = Column(Date, nullable=True)
+    real_end_date = Column(Date, nullable=True)
+    related_task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)    
+    related_task = relationship("Task")
     project = relationship("Project", back_populates="work_items")    
     contracts = relationship("Contract", back_populates="work_item")
-
 class Contract(Base):
-
     __tablename__ = "contracts"    
     id = Column(Integer, primary_key=True, index=True)
     numero_contrato = Column(String, index=True)
@@ -101,6 +139,9 @@ class Contract(Base):
     aplica_iva = Column(Boolean, default=True)
     dms_folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
     status = Column(String, default="Borrador")
+    start_date = Column(Date, nullable=True)
+    end_date = Column(Date, nullable=True)
+    avance_fisico = Column(Float, default=0.0)
     external_url = Column(String, nullable=True)  
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     contractor_id = Column(Integer, ForeignKey("contractors.id"), nullable=False)
@@ -112,6 +153,7 @@ class Contract(Base):
     contract_items = relationship("ContractItem", back_populates="contract", cascade="all, delete-orphan")
     estimates = relationship("Estimate", back_populates="contract", cascade="all, delete-orphan")
     documents = relationship("Document", secondary="document_contract_link", back_populates="contracts")
+    change_orders = relationship("ChangeOrder", back_populates="contract", cascade="all, delete-orphan")
 
 class ContractItem(Base):
 
@@ -132,9 +174,12 @@ class ContractItem(Base):
     cantidad_aditiva = Column(Float, default=0.0)
     cantidad_deductiva = Column(Float, default=0.0)    
     contract = relationship("Contract", back_populates="contract_items")
-    estimate_items = relationship("EstimateItem", back_populates="contract_item", cascade="all, delete-orphan")    
+    estimate_items = relationship("EstimateItem", back_populates="contract_item", cascade="all, delete-orphan")
+    change_order_items = relationship("ChangeOrderItem", back_populates="contract_item", cascade="all, delete-orphan")    
     parent = relationship("ContractItem", back_populates="subitems", remote_side=[id])
     subitems = relationship("ContractItem", back_populates="parent", cascade="all, delete-orphan")
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)
+    task = relationship("Task", back_populates="contract_items")
 
 class Estimate(Base):
     __tablename__ = "estimates"    
@@ -182,6 +227,44 @@ class BimElement(Base):
     __tablename__ = "bim_elements"
     id = Column(Integer, primary_key=True, index=True); guid = Column(String, index=True, nullable=False); ifc_type = Column(String, index=True); name = Column(String); properties = Column(JSON, nullable=True); document_version_id = Column(Integer, ForeignKey("document_versions.id"), nullable=False)
     document_version = relationship("DocumentVersion", back_populates="bim_elements")
+
+    document_version = relationship("DocumentVersion", back_populates="bim_elements")
+
+    document_version = relationship("DocumentVersion", back_populates="bim_elements")
+
+class ChangeOrder(Base):
+    __tablename__ = "change_orders"
+    id = Column(Integer, primary_key=True, index=True)
+    contract_id = Column(Integer, ForeignKey("contracts.id"), nullable=False)
+    code = Column(String, nullable=True) # "CV-MOD-01"
+    signature_date = Column(Date, nullable=True)
+    status = Column(String, default="DRAFT") # DRAFT, PENDING, APPROVED, REJECTED
+    justification = Column(Text, nullable=True)
+    pdf_url = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    contract = relationship("Contract", back_populates="change_orders")
+    items = relationship("ChangeOrderItem", back_populates="change_order", cascade="all, delete-orphan")
+
+class ChangeOrderItem(Base):
+    __tablename__ = "change_order_items"
+    id = Column(Integer, primary_key=True, index=True)
+    change_order_id = Column(Integer, ForeignKey("change_orders.id"), nullable=False)
+    
+    # Opción A: Modificación a existente
+    contract_item_id = Column(Integer, ForeignKey("contract_items.id"), nullable=True)
+    
+    # Opción B: Nuevo concepto
+    is_extraordinary = Column(Boolean, default=False)
+    extraordinary_concept = Column(String, nullable=True)
+    
+    unit = Column(String, nullable=True)
+    unit_price = Column(Float, default=0.0)
+    quantity_delta = Column(Float, default=0.0) # + o -
+    notes = Column(Text, nullable=True)
+    
+    change_order = relationship("ChangeOrder", back_populates="items")
+    contract_item = relationship("ContractItem", back_populates="change_order_items")
 
 # --- BCF (BIM Collaboration Format) Tables ---
 

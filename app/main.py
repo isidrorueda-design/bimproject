@@ -48,6 +48,48 @@ app.add_middleware(
 app.include_router(bcf.router)
 app.include_router(ifc.router)
 
+# --- Debug Endpoint ---
+@app.post("/debug/seed_data/")
+def seed_data_endpoint(db: Session = Depends(get_db)):
+    try:
+        # Ensure tables exist (Reset DB logic)
+        from .database import engine
+        from . import models
+        models.Base.metadata.create_all(bind=engine)
+
+        # Create simple data structure for testing
+        import uuid
+        suffix = str(uuid.uuid4())[:8]
+        
+        # Company
+        company = models.Company(name=f"C-{suffix}", rfc=f"RFC{suffix}", address=".")
+        db.add(company); db.commit(); db.refresh(company)
+        
+        # Project
+        project = models.Project(name=f"P-{suffix}", company_id=company.id)
+        db.add(project); db.commit(); db.refresh(project)
+        
+        # Contractor
+        contractor = models.Contractor(razon_social=f"Cont-{suffix}", project_id=project.id)
+        db.add(contractor); db.commit(); db.refresh(contractor)
+        
+        # Contract
+        contract = models.Contract(numero_contrato=f"CT-{suffix}", contractor_id=contractor.id, project_id=project.id, monto_contratado_manual=1000.0)
+        db.add(contract); db.commit(); db.refresh(contract)
+        
+        # Contract Item
+        item = models.ContractItem(contract_id=contract.id, concepto="Base Item", cantidad_contratada=100.0, precio_unitario=50.0)
+        db.add(item); db.commit(); db.refresh(item)
+        
+        return {
+            "project_id": project.id,
+            "contract_id": contract.id,
+            "contract_item_id": item.id
+        }
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Seed Failed: {str(e)} {traceback.format_exc()}")
+
 @app.post("/login", response_model=schemas.Token)
 def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(), 
@@ -555,6 +597,21 @@ def update_work_item_endpoint(
     get_project_for_user(db, db_work_item.project_id, current_user.company_id)
     db_work_item_updated = crud.update_work_item(db, work_item_id=work_item_id, work_item_update=work_item_update)
     return db_work_item_updated
+
+@app.patch("/work_items/{work_item_id}", response_model=schemas.WorkItem)
+def update_work_item_partial(
+    work_item_id: int,
+    work_item_update: schemas.WorkItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    """Permite actualizaciones parciales (ej. fechas en grid)"""
+    db_work_item = crud.get_work_item(db, work_item_id=work_item_id)
+    if not db_work_item:
+        raise HTTPException(status_code=404, detail="Partida no encontrada")
+    get_project_for_user(db, db_work_item.project_id, current_user.company_id)
+    return crud.update_work_item(db, work_item_id=work_item_id, work_item_update=work_item_update)
+
 @app.delete("/work_items/{work_item_id}", status_code=204)
 def delete_work_item_endpoint(
     work_item_id: int, 
@@ -585,6 +642,76 @@ def read_project_contracts_endpoint(
 ):
     get_project_for_user(db, project_id, current_user.company_id)
     return crud.get_project_contracts(db=db, project_id=project_id)
+
+@app.post("/projects/{project_id}/contracts/{contract_id}/change_orders/", response_model=schemas.ChangeOrder)
+def create_change_order_endpoint(
+    project_id: int,
+    contract_id: int,
+    change_order: schemas.ChangeOrderCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    # get_project_for_user(db, project_id, current_user.company_id)
+    contract = crud.get_contract(db, contract_id)
+    if not contract or contract.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    return crud.create_change_order(db=db, change_order=change_order, contract_id=contract_id)
+
+@app.get("/projects/{project_id}/contracts/{contract_id}/change_orders/", response_model=List[schemas.ChangeOrder])
+def read_change_orders_endpoint(
+    project_id: int,
+    contract_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    # get_project_for_user(db, project_id, current_user.company_id)
+    return crud.get_change_orders(db, contract_id)
+
+@app.post("/change_orders/{change_order_id}/items/", response_model=schemas.ChangeOrderItem)
+def add_change_order_item_endpoint(
+    change_order_id: int,
+    item: schemas.ChangeOrderItemCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    return crud.add_change_order_item(db=db, item=item, change_order_id=change_order_id)
+
+@app.delete("/change_orders/items/{item_id}")
+def delete_change_order_item_endpoint(item_id: int, db: Session = Depends(get_db)):
+    try:
+        success = crud.delete_change_order_item(db=db, item_id=item_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Item no encontrado")
+        return {"message": "Item eliminado"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/change_orders/items/{item_id}", response_model=schemas.ChangeOrderItem)
+def update_change_order_item_endpoint(
+    item_id: int, 
+    item_data: schemas.ChangeOrderItemUpdate, 
+    db: Session = Depends(get_db)
+):
+    try:
+        updated_item = crud.update_change_order_item(
+            db=db, 
+            item_id=item_id, 
+            update_data=item_data
+        )
+        if not updated_item:
+            raise HTTPException(status_code=404, detail="Item no encontrado")
+        return updated_item
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/change_orders/{change_order_id}/approve/", response_model=schemas.ChangeOrder)
+def approve_change_order_endpoint(
+    change_order_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
+    # Validar permisos de aprobación si es necesario
+    return crud.approve_change_order(db, change_order_id)
 
 @app.get("/projects/{project_id}/estimates/", response_model=List[schemas.Estimate])
 def read_project_estimates(
@@ -687,6 +814,13 @@ def create_contract_item_endpoint(
     if not db_contract or db_contract.project.company_id != current_user.company_id:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
     return crud.create_contract_item(db=db, item=item, contract_id=contract_id)
+@app.put("/contract_items/{item_id}", response_model=schemas.ContractItem)
+def update_contract_item_endpoint(
+    item_id: int,
+    item_update: schemas.ContractItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(dependencies.get_current_company_user)
+):
     db_item = crud.get_contract_item(db, item_id=item_id)
     if not db_item:
         raise HTTPException(status_code=404, detail="Item de contrato no encontrado")
@@ -694,13 +828,14 @@ def create_contract_item_endpoint(
     return crud.update_contract_item(db, item_id=item_id, item_update=item_update)
 
 @app.patch("/contract_items/{item_id}", response_model=schemas.ContractItem)
-def patch_contract_item_endpoint(
-    item_id: int,
-    item_update: schemas.ContractItemUpdate,
+def update_contract_item_partial(
+    item_id: int, 
+    item_update: schemas.ContractItemUpdate, 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(dependencies.get_current_company_user)
 ):
-    return update_contract_item_endpoint(item_id=item_id, item_update=item_update, db=db, current_user=current_user)
+    """Permite actualizar parcialmente un concepto (ej. avance_fisico)."""
+    return crud.update_contract_item(db=db, item_id=item_id, item_update=item_update)
 @app.delete("/contract_items/{item_id}", status_code=204)
 def delete_contract_item_endpoint(
     item_id: int,

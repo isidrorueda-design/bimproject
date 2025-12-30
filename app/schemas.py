@@ -1,4 +1,4 @@
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, computed_field, Field
 from typing import Optional, List
 from datetime import date, datetime
 class Token(BaseModel): access_token: str; token_type: str
@@ -112,11 +112,33 @@ class BimElement(BimElementBase):
 class WorkItemBase(BaseModel):
     item_code: str
     description: Optional[str] = None
-    presupuesto_base: float = 0.0; planned_start_date: Optional[date] = None; planned_end_date: Optional[date] = None; real_start_date: Optional[date] = None; real_end_date: Optional[date] = None; related_task_id: Optional[int] = None
+    presupuesto_base: float = 0.0
+    planned_start_date: Optional[date] = Field(default=None, alias="planned_start")
+    planned_end_date: Optional[date] = Field(default=None, alias="planned_end")
+    real_start_date: Optional[date] = Field(default=None, alias="real_start")
+    real_end_date: Optional[date] = Field(default=None, alias="real_end")
+    related_task_id: Optional[int] = None
+    
+    class Config:
+        populate_by_name = True
+        from_attributes = True
+
 class WorkItemCreate(WorkItemBase):
     pass
+
 class WorkItemUpdate(BaseModel):
-    item_code: Optional[str] = None; description: Optional[str] = None; presupuesto_base: Optional[float] = None; planned_start_date: Optional[date] = None; planned_end_date: Optional[date] = None; real_start_date: Optional[date] = None; real_end_date: Optional[date] = None; related_task_id: Optional[int] = None
+    item_code: Optional[str] = None
+    description: Optional[str] = None
+    presupuesto_base: Optional[float] = None
+    planned_start_date: Optional[date] = Field(default=None, alias="planned_start")
+    planned_end_date: Optional[date] = Field(default=None, alias="planned_end")
+    real_start_date: Optional[date] = Field(default=None, alias="real_start")
+    real_end_date: Optional[date] = Field(default=None, alias="real_end")
+    related_task_id: Optional[int] = None
+    
+    class Config:
+        populate_by_name = True
+
 class WorkItemSimple(WorkItemBase):
     id: int; project_id: int
     class Config: from_attributes = True
@@ -253,6 +275,48 @@ class ContractUpdate(BaseModel):
     dms_folder_id: Optional[int] = None
     status: Optional[str] = None; external_url: Optional[str] = None; work_item_id: Optional[int] = None
     start_date: Optional[date] = None; end_date: Optional[date] = None; avance_fisico: Optional[float] = None
+    start_date: Optional[date] = None; end_date: Optional[date] = None; avance_fisico: Optional[float] = None
+
+    start_date: Optional[date] = None; end_date: Optional[date] = None; avance_fisico: Optional[float] = None
+
+class ChangeOrderItemBase(BaseModel):
+    contract_item_id: Optional[int] = None
+    is_extraordinary: bool = False
+    extraordinary_concept: Optional[str] = None
+    unit: Optional[str] = None
+    unit_price: float = 0.0
+    quantity_delta: float
+    notes: Optional[str] = None
+
+class ChangeOrderItemCreate(ChangeOrderItemBase):
+    pass
+
+class ChangeOrderItemUpdate(BaseModel):
+    quantity_delta: float
+    unit_price: Optional[float] = None
+
+
+class ChangeOrderItem(ChangeOrderItemBase):
+    id: int
+    change_order_id: int
+    class Config: from_attributes = True
+
+class ChangeOrderBase(BaseModel):
+    code: Optional[str] = None
+    signature_date: Optional[date] = None
+    status: Optional[str] = "DRAFT"
+    justification: Optional[str] = None
+    pdf_url: Optional[str] = None
+
+class ChangeOrderCreate(ChangeOrderBase):
+    items: List[ChangeOrderItemCreate] = []
+
+class ChangeOrder(ChangeOrderBase):
+    id: int
+    contract_id: int
+    items: List[ChangeOrderItem] = []
+    created_at: Optional[datetime] = None
+    class Config: from_attributes = True
 
 class ContractSimple(ContractBase):
     id: int
